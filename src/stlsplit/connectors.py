@@ -1,0 +1,493 @@
+from __future__ import annotations
+
+from typing import List, Optional, Tuple
+
+import numpy as np
+import trimesh
+
+from .config import ConnectorConfig
+from .mesh_ops import (
+    boolean_op,
+    embossed_text_mesh,
+    pick_triangulation_engine,
+    plane_basis,
+    repair_mesh,
+    rotation_from_z,
+)
+
+
+def connector_positions(
+    section_vertices: np.ndarray,
+    plane_origin: np.ndarray,
+    plane_normal: np.ndarray,
+    connector_count: int,
+    margin_mm: float,
+) -> List[np.ndarray]:
+    """
+    Calculate peg positions based on the 2D cross-section of the cut.
+    Returns positions ON the cut plane.
+    """
+    if section_vertices is None or len(section_vertices) == 0:
+        print(f"DEBUG: No section vertices, using plane_origin: {plane_origin}")
+        return [plane_origin.copy()]
+
+    _, u, v = plane_basis(plane_normal)
+    
+    # Project vertices onto the plane's 2D coordinate system
+    coords = np.vstack(
+        (
+            np.dot(section_vertices - plane_origin, u),
+            np.dot(section_vertices - plane_origin, v),
+        )
+    ).T
+    
+    if not np.isfinite(coords).all():
+        print(f"DEBUG: Non-finite coords, using plane_origin")
+        return [plane_origin.copy()]
+
+    min_uv = coords.min(axis=0)
+    max_uv = coords.max(axis=0)
+    extents_uv = max_uv - min_uv
+    center_uv = (min_uv + max_uv) * 0.5
+    
+    print(f"DEBUG: Section extents UV: {extents_uv}, center UV: {center_uv}")
+
+    # Choose the longer axis for spreading multiple connectors
+    if extents_uv[0] >= extents_uv[1]:
+        axis_idx = 0
+    else:
+        axis_idx = 1
+
+    max_offset = (extents_uv[axis_idx] * 0.5) - margin_mm
+    
+    if connector_count <= 1 or max_offset <= 0:
+        # Just one in the center
+        pos = plane_origin + u * center_uv[0] + v * center_uv[1]
+        print(f"DEBUG: Single connector position: {pos}")
+        return [pos]
+
+    # Spread along the chosen axis
+    offsets = np.linspace(-max_offset, max_offset, connector_count)
+    
+    results = []
+    for off in offsets:
+        if axis_idx == 0:
+            p = plane_origin + u * (center_uv[0] + off) + v * center_uv[1]
+        else:
+            p = plane_origin + u * center_uv[0] + v * (center_uv[1] + off)
+        results.append(p)
+    
+    print(f"DEBUG: Generated {len(results)} connector positions")
+    return results
+
+
+def make_hex_prism(radius: float, height: float) -> trimesh.Trimesh:
+    """Creates a hex prism (6-sided cylinder) aligned to Z axis."""
+    return trimesh.creation.cylinder(radius=radius, height=height, sections=6)
+
+
+def make_dovetail(width: float, height: float, depth: float, angle_deg: float) -> trimesh.Trimesh:
+    """
+    Creates a dovetail wedge.
+    width: bottom (widest) width
+    height: total thickness of the wedge
+    depth: how far it extends into the part
+    angle_deg: angle of the sides
+    """
+    angle = np.radians(angle_deg)
+    top_width = width - 2.0 * depth * np.tan(angle)
+    if top_width <= 0:
+        top_width = width * 0.5
+
+    # Vertices for a wedge pointing along Y+
+    # x - width, y - depth, z - height
+    v = np.array([
+        [-width/2, 0, -height/2], [width/2, 0, -height/2], [width/2, 0, height/2], [-width/2, 0, height/2],
+        [-top_width/2, depth, -height/2], [top_width/2, depth, -height/2], [top_width/2, depth, height/2], [-top_width/2, depth, height/2]
+    ])
+    f = np.array([
+        [0, 1, 2], [0, 2, 3], # Bottom
+        [4, 6, 5], [4, 7, 6], # Top
+        [0, 4, 5], [0, 5, 1], # Side 1
+        [1, 5, 6], [1, 6, 2], # Side 2
+        [2, 6, 7], [2, 7, 3], # Side 3
+        [3, 7, 4], [3, 4, 0]  # Side 4
+    ])
+    return trimesh.Trimesh(vertices=v, faces=f)
+
+def _section_bbox_area(
+    section_vertices: np.ndarray,
+    plane_origin: np.ndarray,
+    plane_normal: np.ndarray,
+) -> float:
+    if section_vertices is None or len(section_vertices) < 3:
+        return 0.0
+
+    _, u, v = plane_basis(plane_normal)
+    coords = np.vstack(
+        (
+            np.dot(section_vertices - plane_origin, u),
+            np.dot(section_vertices - plane_origin, v),
+        )
+    ).T
+    extents_uv = coords.max(axis=0) - coords.min(axis=0)
+    return float(extents_uv[0] * extents_uv[1])
+
+def _ensure_volume(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    if mesh.is_volume:
+        return mesh
+    fixed = mesh.copy()
+    try:
+        fixed = repair_mesh(fixed)
+    except Exception:
+        pass
+    if not fixed.is_volume:
+        try:
+            fixed.process(validate=True)
+        except Exception:
+            return fixed
+    return fixed
+
+def _clean_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    cleaned = mesh.copy()
+    try:
+        cleaned.remove_infinite_values()
+        cleaned.remove_unreferenced_vertices()
+    except Exception:
+        pass
+    try:
+        cleaned.process(validate=True)
+    except Exception:
+        pass
+    return cleaned
+
+def _finite_vertices(vertices: np.ndarray) -> np.ndarray:
+    if vertices is None or len(vertices) == 0:
+        return np.array([], dtype=float).reshape(0, 3)
+    mask = np.isfinite(vertices).all(axis=1)
+    return vertices[mask]
+
+
+def _cap_patch_from_section(
+    section_path: Optional[trimesh.path.Path3D],
+    section_vertices: np.ndarray,
+    plane_origin: np.ndarray,
+    plane_normal: np.ndarray,
+    depth: float,
+    engine: Optional[str],
+    direction: float,
+) -> Optional[trimesh.Trimesh]:
+    patches = []
+    if section_path is not None:
+        try:
+            planar, to_3d = section_path.to_2D(normal=plane_normal)
+            polygons = list(getattr(planar, "polygons_full", []))
+            for poly in polygons:
+                patch = trimesh.creation.extrude_polygon(poly, height=depth, engine=engine)
+                if direction < 0:
+                    patch.apply_translation([0.0, 0.0, -depth])
+                patch.apply_transform(to_3d)
+                patch = _clean_mesh(patch)
+                patches.append(patch)
+        except Exception:
+            patches = []
+
+    if not patches and section_vertices is not None and len(section_vertices) >= 3:
+        try:
+            from shapely.geometry import MultiPoint
+
+            _, u, v = plane_basis(plane_normal)
+            coords = np.vstack(
+                (
+                    np.dot(section_vertices - plane_origin, u),
+                    np.dot(section_vertices - plane_origin, v),
+                )
+            ).T
+            if np.isfinite(coords).all():
+                poly = MultiPoint(coords).convex_hull
+                if not poly.is_empty and poly.area > 0:
+                    patch = trimesh.creation.extrude_polygon(
+                        poly, height=depth, engine=engine
+                    )
+                    if direction < 0:
+                        patch.apply_translation([0.0, 0.0, -depth])
+                    transform = np.eye(4)
+                    transform[:3, 0] = u
+                    transform[:3, 1] = v
+                    transform[:3, 2] = plane_normal / np.linalg.norm(plane_normal)
+                    transform[:3, 3] = plane_origin
+                    patch.apply_transform(transform)
+                    patch = _clean_mesh(patch)
+                    patches.append(patch)
+        except Exception:
+            pass
+
+    if not patches:
+        return None
+    return trimesh.util.concatenate(patches)
+
+
+def _remove_cap_faces(
+    mesh: trimesh.Trimesh,
+    plane_origin: np.ndarray,
+    plane_normal: np.ndarray,
+    tol: float,
+) -> trimesh.Trimesh:
+    if mesh.faces is None or len(mesh.faces) == 0:
+        return mesh
+    if not np.isfinite(mesh.vertices).all():
+        return mesh
+    if not np.isfinite(plane_origin).all() or not np.isfinite(plane_normal).all():
+        return mesh
+    norm = np.linalg.norm(plane_normal)
+    if norm == 0.0:
+        return mesh
+    n = plane_normal / norm
+    centers = mesh.triangles_center
+    if not np.isfinite(centers).all():
+        return mesh
+    distances = np.abs((centers - plane_origin) @ n)
+    face_normals = mesh.face_normals
+    if not np.isfinite(face_normals).all():
+        return mesh
+    aligned = np.abs(face_normals @ n) > 0.9
+    keep = ~(aligned & (distances < tol))
+    if keep.all():
+        return mesh
+    try:
+        return mesh.submesh([np.nonzero(keep)[0]], append=True)
+    except Exception:
+        return mesh
+
+def apply_connectors(
+    pos_mesh: trimesh.Trimesh,
+    neg_mesh: trimesh.Trimesh,
+    plane_origin: np.ndarray,
+    plane_normal: np.ndarray,
+    config: ConnectorConfig,
+    engine: str,
+    label: Optional[str] = None,
+    ai_key: Optional[str] = None,
+    section_vertices: Optional[np.ndarray] = None,
+    section_area: Optional[float] = None,
+    section_path: Optional[trimesh.path.Path3D] = None,
+) -> Tuple[trimesh.Trimesh, trimesh.Trimesh]:
+    """
+    Intelligently applies connectors and optional assembly labels.
+    """
+    base_pos = pos_mesh
+    base_neg = neg_mesh
+
+    # Heuristic for 'auto'
+    vertices = section_vertices
+    area = section_area
+    if vertices is None or area is None:
+        try:
+            section = pos_mesh.section(plane_origin=plane_origin, plane_normal=plane_normal)
+            if section is not None:
+                vertices = section.vertices
+                area = section.area
+        except Exception:
+            pass
+
+    vertices = _finite_vertices(vertices)
+    if area is None:
+        area = 0.0
+
+    if area <= 0.0:
+        area = _section_bbox_area(vertices, plane_origin, plane_normal)
+
+    style = config.style
+    if style == "auto":
+        # AI Decision
+        if ai_key:
+            from .ai import recommend_connector_with_gemini
+            style = recommend_connector_with_gemini(vertices, ai_key)
+            print(f"Gemini recommended connector: {style}")
+        # Fallback Heuristic
+        elif area <= 0:
+            style = "hex"
+        elif area > 800:
+            style = "dovetail"
+        elif area < 30:
+            style = "none"
+        else:
+            style = "hex"
+
+    if style == "none" and not label:
+        return pos_mesh, neg_mesh
+
+    # Positions for connectors
+    conn_margin = config.peg_radius_mm * 2.5
+    if style == "dovetail":
+        conn_margin = config.dovetail_width_mm * 1.5
+        
+    positions = connector_positions(
+        vertices, plane_origin, plane_normal, config.count, conn_margin
+    )
+
+    rot = rotation_from_z(plane_normal)
+    pegs = []
+    sockets = []
+    
+    # Handle Labeling
+    if label:
+        text_mesh = embossed_text_mesh(label, height=5.0) # 5mm tall letters
+        # Move it to the center of the cut
+        center = np.mean(vertices, axis=0) if len(vertices) > 0 else plane_origin
+        # Orient it. Text mesh is in XY plane, pointing +Z. 
+        # We want it on the cut face.
+        text_mesh.apply_transform(rot)
+        # Shift slightly so it's half-in, half-out or fully recessed.
+        # Let's do 1mm recess.
+        depth = 2.0 # Thickness of the box/letter
+        text_mesh.apply_translation(center - plane_normal * (depth * 0.5))
+        
+        # We subtract from both sides to create a "shared" label cavity? 
+        # Actually, let's subtract from neg and add/subtract from pos?
+        # Better: Subtract from both to create a clear mark.
+        if text_mesh.is_volume:
+            sockets.append(text_mesh)
+        # To avoid overlaps with pegs, we should check distance.
+        # For now, just append.
+
+    for i, pos in enumerate(positions):
+        if style == "hex":
+            r, d = config.peg_radius_mm, config.peg_depth_mm
+            tol = config.tolerance_mm
+            
+            # Keying logic: scale the first peg slightly to enforce orientation
+            if i == 0 and len(positions) > 1:
+                r *= 1.2
+            
+            p = make_hex_prism(r, d)
+            p.apply_transform(rot)
+            p.apply_translation(pos + plane_normal * (d * 0.5))
+            pegs.append(p)
+
+            s = make_hex_prism(r + tol, d + tol * 2)
+            s.apply_transform(rot)
+            s.apply_translation(pos - plane_normal * (d * 0.5 + tol))
+            sockets.append(s)
+
+        elif style == "magnet":
+            r, d = config.magnet_radius_mm, config.magnet_depth_mm
+            # Magnets are just holes on both sides
+            s1 = trimesh.creation.cylinder(radius=r, height=d*2)
+            s1.apply_transform(rot)
+            s1.apply_translation(pos)
+            pegs.append(s1) # We use pegs list to indicate "subtract from pos" here? 
+            # Actually let's just use subtraction for both if it's magnet holes.
+            
+            s2 = trimesh.creation.cylinder(radius=r, height=d*2)
+            s2.apply_transform(rot)
+            s2.apply_translation(pos)
+            sockets.append(s2)
+
+        elif style == "dovetail":
+            w, h, d = config.dovetail_width_mm, config.peg_radius_mm * 2, config.peg_depth_mm
+            tol = config.tolerance_mm
+            
+            p = make_dovetail(w, h, d, config.dovetail_angle_deg)
+            # Dovetail points along Y in our maker, needs to point along normal
+            # So we rotate it.
+            p.apply_transform(trimesh.transformations.rotation_matrix(np.pi/2, [1,0,0]))
+            p.apply_transform(rot)
+            p.apply_translation(pos)
+            pegs.append(p)
+
+            s = make_dovetail(w + tol*2, h + tol*2, d + tol, config.dovetail_angle_deg)
+            s.apply_transform(trimesh.transformations.rotation_matrix(np.pi/2, [1,0,0]))
+            s.apply_transform(rot)
+            s.apply_translation(pos)
+            sockets.append(s)
+
+    try:
+        if not pegs:
+            return pos_mesh, neg_mesh
+
+        # Clean and AGGRESSIVELY REPAIR meshes before booleans
+        pos_mesh = _clean_mesh(base_pos)
+        neg_mesh = _clean_mesh(base_neg)
+        
+        # Apply aggressive repair using PyMeshFix (if available)
+        print("DEBUG: Repairing meshes for boolean operations...")
+        pos_mesh = repair_mesh(pos_mesh)
+        neg_mesh = repair_mesh(neg_mesh)
+        print(f"DEBUG: pos_mesh.is_volume={pos_mesh.is_volume}, neg_mesh.is_volume={neg_mesh.is_volume}")
+
+        peg_comb = trimesh.util.concatenate(pegs)
+        sock_comb = trimesh.util.concatenate(sockets)
+
+        peg_comb = _ensure_volume(peg_comb)
+        sock_comb = _ensure_volume(sock_comb)
+
+        # Try multiple boolean engines
+        engines_to_try = [engine, "blender", "scad"]
+        
+        pos_success = False
+        neg_success = False
+        
+        # 1. Try to apply PEGS (Union to Positive Mesh)
+        peg_errors = []
+        for try_engine in engines_to_try:
+            try:
+                if style == "magnet":
+                    # Magnets are holes on both sides
+                    res = boolean_op([pos_mesh.copy(), peg_comb], op="difference", engine=try_engine)
+                else:
+                    res = boolean_op([pos_mesh.copy(), peg_comb], op="union", engine=try_engine)
+                
+                if res is not None and len(res.faces) > 0:
+                    pos_mesh = res
+                    pos_success = True
+                    print(f"DEBUG: Peg boolean SUCCESS with engine={try_engine}")
+                    break
+            except Exception as e:
+                peg_errors.append(f"{try_engine}: {e}")
+                continue
+        
+        if not pos_success:
+            print(f"DEBUG: All peg boolean engines failed: {peg_errors}")
+                
+        # Fallback for Pegs: Concatenate if boolean failed (only for non-magnets)
+        if not pos_success and style != "magnet":
+            try:
+                print("Warning: Peg boolean failed, falling back to concatenation.")
+                pos_mesh = trimesh.util.concatenate([base_pos, peg_comb])
+                pos_success = True
+            except Exception:
+                pass
+
+        # 2. Try to apply SOCKETS (Difference from Negative Mesh)
+        for try_engine in engines_to_try:
+            try:
+                if style == "magnet":
+                    res = boolean_op([neg_mesh.copy(), sock_comb], op="difference", engine=try_engine)
+                else:
+                    res = boolean_op([neg_mesh.copy(), sock_comb], op="difference", engine=try_engine)
+                
+                if res is not None and len(res.faces) > 0:
+                    neg_mesh = res
+                    neg_success = True
+                    break
+            except Exception:
+                continue
+
+        # Report status
+        if pos_success and neg_success:
+            return pos_mesh, neg_mesh
+        elif pos_success:
+            print("Warning: Sockets failed (boolean error), but Pegs were applied.")
+            return pos_mesh, neg_mesh # Return what we have (one side with connectors)
+        elif neg_success:
+            print("Warning: Pegs failed, but Sockets were applied.")
+            return pos_mesh, neg_mesh
+
+        # If everything failed
+        print(f"Warning: All connector attempts failed. Returning meshes without connectors.")
+        return base_pos, base_neg
+        
+    except Exception as e:
+        print(f"Warning: Connector generation failed ({e}), returning meshes without connectors.")
+        return base_pos, base_neg

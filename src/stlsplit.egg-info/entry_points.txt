@@ -1,0 +1,3 @@
+[console_scripts]
+stlsplit = stlsplit.cli:main
+stlsplit-gui = stlsplit.gui_launcher:main

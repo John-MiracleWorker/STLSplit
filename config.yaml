@@ -1,0 +1,22 @@
+build_volume:
+  x_mm: 220
+  y_mm: 220
+  z_mm: 250
+connectors:
+  style: hex
+  tolerance_mm: 0.15
+  peg_radius_mm: 4.0
+  peg_depth_mm: 8.0
+  count: 2
+split:
+  max_depth: 6
+  max_pieces: 0
+  cut_samples: 5
+  curvature_band_mm: 6.0
+  roughness_weight: 1.0
+  density_weight: 1.0
+  orient_step_deg: 90
+  cut_margin_mm: 2.0
+output:
+  format: 3mf
+  engine: manifold
