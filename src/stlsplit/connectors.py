@@ -99,21 +99,255 @@ def make_dovetail(width: float, height: float, depth: float, angle_deg: float) -
     if top_width <= 0:
         top_width = width * 0.5
 
-    # Vertices for a wedge pointing along Y+
-    # x - width, y - depth, z - height
-    v = np.array([
-        [-width/2, 0, -height/2], [width/2, 0, -height/2], [width/2, 0, height/2], [-width/2, 0, height/2],
-        [-top_width/2, depth, -height/2], [top_width/2, depth, -height/2], [top_width/2, depth, height/2], [-top_width/2, depth, height/2]
-    ])
+    # Re-oriented to point along Z+ (Depth is Z)
+    # This ensures it aligns with the cut normal correctly
+    # x - width, y - thickness (height arg), z - depth
+    
+    # Vertices
+    # Base at Z=0
+    v_base = [
+        [-width/2, -height/2, 0], 
+        [width/2, -height/2, 0], 
+        [width/2, height/2, 0], 
+        [-width/2, height/2, 0]
+    ]
+    # Tip at Z=depth
+    v_tip = [
+        [-top_width/2, -height/2, depth], 
+        [top_width/2, -height/2, depth], 
+        [top_width/2, height/2, depth], 
+        [-top_width/2, height/2, depth]
+    ]
+    v = np.array(v_base + v_tip)
+
     f = np.array([
-        [0, 1, 2], [0, 2, 3], # Bottom
-        [4, 6, 5], [4, 7, 6], # Top
-        [0, 4, 5], [0, 5, 1], # Side 1
-        [1, 5, 6], [1, 6, 2], # Side 2
-        [2, 6, 7], [2, 7, 3], # Side 3
-        [3, 7, 4], [3, 4, 0]  # Side 4
+        [0, 2, 1], [0, 3, 2], # Bottom (Base)
+        [4, 5, 6], [4, 6, 7], # Top (Tip)
+        [0, 1, 5], [0, 5, 4], # Side 1 (Front?)
+        [1, 2, 6], [1, 6, 5], # Side 2 (Right)
+        [2, 3, 7], [2, 7, 6], # Side 3 (Back?)
+        [3, 0, 4], [3, 4, 7]  # Side 4 (Left)
     ])
     return trimesh.Trimesh(vertices=v, faces=f)
+
+
+def is_thin_walled_section(
+    section_vertices: np.ndarray,
+    section_path: Optional[trimesh.path.Path3D],
+    section_area: float,
+    threshold: float = 0.15,
+) -> bool:
+    """
+    Detects thin-walled/shell sections using compactness ratio (area / perimeter^2).
+    
+    Thin shells (like helmet cross-sections) have high perimeter relative to area.
+    This is the "isoperimetric quotient" - circles are most compact (~0.08).
+    
+    Args:
+        section_vertices: 3D vertices of the cross-section
+        section_path: Optional path object with perimeter info
+        section_area: Area of the cross-section
+        threshold: Compactness below this = thin-walled (default 0.15)
+    
+    Returns:
+        True if the section appears to be thin-walled/shell geometry
+    
+    Reference values:
+        - Circle: ~0.08 (most compact)
+        - Square: ~0.0625
+        - Thin ring/shell: ~0.01-0.03
+        - Very thin shell: < 0.01
+    """
+    if section_area <= 0:
+        return False
+    
+    perimeter = 0.0
+    
+    # Try to get perimeter from path first (most accurate)
+    if section_path is not None:
+        try:
+            perimeter = section_path.length
+        except Exception:
+            pass
+    
+    # Fallback: estimate perimeter from vertices
+    if perimeter <= 0 and section_vertices is not None and len(section_vertices) >= 3:
+        try:
+            # Calculate perimeter as sum of edge lengths
+            verts = _finite_vertices(section_vertices)
+            if len(verts) >= 3:
+                # Close the loop
+                edges = np.diff(np.vstack([verts, verts[0:1]]), axis=0)
+                perimeter = float(np.sum(np.linalg.norm(edges, axis=1)))
+        except Exception:
+            pass
+    
+    if perimeter <= 0:
+        return False
+    
+    # Compactness = area / perimeter^2
+    # Lower values = more elongated/thin shape
+    compactness = section_area / (perimeter * perimeter)
+    
+    print(f"DEBUG: Section compactness={compactness:.4f} (area={section_area:.1f}, perimeter={perimeter:.1f})")
+    
+    return compactness < threshold
+
+
+def make_lip_groove(
+    section_path: Optional[trimesh.path.Path3D],
+    section_vertices: np.ndarray,
+    plane_origin: np.ndarray,
+    plane_normal: np.ndarray,
+    lip_height: float,
+    lip_width: float,
+    tolerance: float,
+    engine: Optional[str] = None,
+) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh]]:
+    """
+    Creates a lip (protrusion) and groove (recess) that follows the section profile.
+    
+    For thin-walled models like helmets, this creates an interlocking edge
+    that doesn't require boolean operations to punch through walls.
+    
+    The lip is a thin extrusion along the outer edge of the section.
+    The groove is the matching recess with tolerance added.
+    
+    Args:
+        section_path: Path3D of the cross-section (preferred)
+        section_vertices: Vertices of the cross-section (fallback)
+        plane_origin: Origin point of the cut plane
+        plane_normal: Normal vector of the cut plane
+        lip_height: How far the lip protrudes from the cut plane
+        lip_width: Thickness/width of the lip
+        tolerance: Gap between lip and groove for fit
+        engine: Triangulation engine to use
+    
+    Returns:
+        (lip_mesh, groove_mesh) or (None, None) on failure
+    """
+    from shapely.geometry import MultiPoint, LineString
+    from shapely.ops import unary_union
+    from shapely import buffer
+    
+    try:
+        _, u, v = plane_basis(plane_normal)
+        
+        # Get 2D representation of section
+        poly_2d = None
+        
+        if section_path is not None:
+            try:
+                planar, to_3d = section_path.to_2D(normal=plane_normal)
+                polygons = list(getattr(planar, "polygons_full", []))
+                if polygons:
+                    poly_2d = unary_union(polygons)
+            except Exception:
+                pass
+        
+        # Fallback: use convex hull of vertices
+        if poly_2d is None and section_vertices is not None and len(section_vertices) >= 3:
+            verts = _finite_vertices(section_vertices)
+            if len(verts) >= 3:
+                coords = np.vstack((
+                    np.dot(verts - plane_origin, u),
+                    np.dot(verts - plane_origin, v),
+                )).T
+                if np.isfinite(coords).all():
+                    poly_2d = MultiPoint(coords).convex_hull
+        
+        if poly_2d is None or poly_2d.is_empty:
+            return None, None
+        
+        # Create lip as a thin ring around the outer boundary
+        # Positive buffer then difference = ring shape
+        outer = buffer(poly_2d, lip_width)
+        lip_ring = outer.difference(poly_2d)
+        
+        if lip_ring.is_empty or lip_ring.area <= 0:
+            return None, None
+        
+        # Create groove with tolerance
+        outer_groove = buffer(poly_2d, lip_width + tolerance)
+        groove_ring = outer_groove.difference(buffer(poly_2d, -tolerance))
+        
+        if groove_ring.is_empty:
+            groove_ring = lip_ring  # Fallback
+        
+        # Handle MultiPolygon - extrude each polygon separately and combine
+        from shapely.geometry import MultiPolygon, Polygon
+        
+        def extrude_geometry(geom, height, engine):
+            """Extrude a Polygon or MultiPolygon, handling both cases."""
+            meshes = []
+            if isinstance(geom, MultiPolygon):
+                for poly in geom.geoms:
+                    if not poly.is_empty and poly.area > 0:
+                        try:
+                            m = trimesh.creation.extrude_polygon(poly, height=height, engine=engine)
+                            if m is not None and len(m.vertices) > 0:
+                                meshes.append(m)
+                        except Exception:
+                            pass
+            elif isinstance(geom, Polygon):
+                if not geom.is_empty and geom.area > 0:
+                    try:
+                        m = trimesh.creation.extrude_polygon(geom, height=height, engine=engine)
+                        if m is not None and len(m.vertices) > 0:
+                            meshes.append(m)
+                    except Exception:
+                        pass
+            
+            if not meshes:
+                return None
+            if len(meshes) == 1:
+                return meshes[0]
+            return trimesh.util.concatenate(meshes)
+        
+        # Extrude lip and groove
+        lip_mesh = extrude_geometry(lip_ring, lip_height, engine)
+        groove_mesh = extrude_geometry(groove_ring, lip_height + tolerance * 2, engine)
+        
+        if lip_mesh is None or groove_mesh is None:
+            print("DEBUG: Failed to extrude lip or groove geometry")
+            return None, None
+        
+        # Transform back to 3D space
+        # Build transform: 2D coords are in UV space, need to go to world
+        if section_path is not None:
+            try:
+                _, to_3d = section_path.to_2D(normal=plane_normal)
+                lip_mesh.apply_transform(to_3d)
+                groove_mesh.apply_transform(to_3d)
+            except Exception:
+                # Manual transform
+                transform = np.eye(4)
+                transform[:3, 0] = u
+                transform[:3, 1] = v
+                transform[:3, 2] = plane_normal / np.linalg.norm(plane_normal)
+                transform[:3, 3] = plane_origin
+                lip_mesh.apply_transform(transform)
+                groove_mesh.apply_transform(transform)
+        else:
+            transform = np.eye(4)
+            transform[:3, 0] = u
+            transform[:3, 1] = v
+            transform[:3, 2] = plane_normal / np.linalg.norm(plane_normal)
+            transform[:3, 3] = plane_origin
+            lip_mesh.apply_transform(transform)
+            groove_mesh.apply_transform(transform)
+        
+        # Clean up meshes
+        lip_mesh = _clean_mesh(lip_mesh)
+        groove_mesh = _clean_mesh(groove_mesh)
+        
+        print(f"DEBUG: Created lip ({lip_mesh.vertices.shape[0]} verts) and groove ({groove_mesh.vertices.shape[0]} verts)")
+        
+        return lip_mesh, groove_mesh
+        
+    except Exception as e:
+        print(f"DEBUG: make_lip_groove failed: {e}")
+        return None, None
 
 def _section_bbox_area(
     section_vertices: np.ndarray,
@@ -300,8 +534,12 @@ def apply_connectors(
 
     style = config.style
     if style == "auto":
+        # First: Check if thin-walled section -> use lip/groove
+        if is_thin_walled_section(vertices, section_path, area, config.thin_wall_threshold):
+            style = "lip"
+            print("DEBUG: Detected thin-walled section, using lip & groove connectors")
         # AI Decision
-        if ai_key:
+        elif ai_key:
             from .ai import recommend_connector_with_gemini
             style = recommend_connector_with_gemini(vertices, ai_key)
             print(f"Gemini recommended connector: {style}")
@@ -403,6 +641,32 @@ def apply_connectors(
             s.apply_translation(pos)
             sockets.append(s)
 
+    # Handle lip & groove style separately (not position-based)
+    if style == "lip":
+        lip_mesh, groove_mesh = make_lip_groove(
+            section_path=section_path,
+            section_vertices=vertices,
+            plane_origin=plane_origin,
+            plane_normal=plane_normal,
+            lip_height=config.lip_height_mm,
+            lip_width=config.lip_width_mm,
+            tolerance=config.tolerance_mm,
+            engine=engine,
+        )
+        
+        if lip_mesh is not None and groove_mesh is not None:
+            # Lip goes on positive side, groove on negative side
+            # Position: lip protrudes from cut plane on pos side
+            lip_mesh.apply_translation(plane_normal * 0.01)  # Tiny offset to ensure contact
+            groove_mesh.apply_translation(-plane_normal * (config.lip_height_mm * 0.5))
+            
+            pegs = [lip_mesh]
+            sockets = [groove_mesh]
+            print("DEBUG: Lip & groove connectors created successfully")
+        else:
+            print("DEBUG: Lip & groove creation failed, falling back to no connectors")
+            return pos_mesh, neg_mesh
+
     try:
         if not pegs:
             return pos_mesh, neg_mesh
@@ -450,15 +714,12 @@ def apply_connectors(
         
         if not pos_success:
             print(f"DEBUG: All peg boolean engines failed: {peg_errors}")
-                
-        # Fallback for Pegs: Concatenate if boolean failed (only for non-magnets)
-        if not pos_success and style != "magnet":
-            try:
-                print("Warning: Peg boolean failed, falling back to concatenation.")
-                pos_mesh = trimesh.util.concatenate([base_pos, peg_comb])
-                pos_success = True
-            except Exception:
-                pass
+
+        # NO FALLBACK CONCATENATION - if boolean failed, skip connectors entirely
+        # This prevents floating connector geometry from appearing in the output
+        if not pos_success:
+            print("Warning: Connector boolean failed. Skipping connectors for this cut.")
+            return base_pos, base_neg
 
         # 2. Try to apply SOCKETS (Difference from Negative Mesh)
         for try_engine in engines_to_try:
@@ -480,12 +741,9 @@ def apply_connectors(
             return pos_mesh, neg_mesh
         elif pos_success:
             print("Warning: Sockets failed (boolean error), but Pegs were applied.")
-            return pos_mesh, neg_mesh # Return what we have (one side with connectors)
-        elif neg_success:
-            print("Warning: Pegs failed, but Sockets were applied.")
-            return pos_mesh, neg_mesh
-
-        # If everything failed
+            return pos_mesh, base_neg  # Return pos with connectors, neg without
+        
+        # If everything failed, return without connectors
         print(f"Warning: All connector attempts failed. Returning meshes without connectors.")
         return base_pos, base_neg
         

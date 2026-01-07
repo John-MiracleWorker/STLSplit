@@ -191,7 +191,10 @@ def pick_triangulation_engine(
 
 
 def boolean_op(
-    meshes: Iterable[trimesh.Trimesh], op: str, engine: str
+    meshes: Iterable[trimesh.Trimesh],
+    op: str,
+    engine: str,
+    check_volume: bool = True,
 ) -> trimesh.Trimesh:
     engines_available = getattr(trimesh.boolean, "engines_available", set())
     engines_to_try = []
@@ -207,7 +210,9 @@ def boolean_op(
         last_error = None
         for candidate in engines_to_try:
             try:
-                return trimesh.boolean.union(list(meshes), engine=candidate)
+                return trimesh.boolean.union(
+                    list(meshes), engine=candidate, check_volume=check_volume
+                )
             except Exception as e:
                 last_error = e
         raise last_error or ValueError("No boolean engine available for union")
@@ -218,7 +223,9 @@ def boolean_op(
         last_error = None
         for candidate in engines_to_try:
             try:
-                return trimesh.boolean.difference(meshes, engine=candidate)
+                return trimesh.boolean.difference(
+                    meshes, engine=candidate, check_volume=check_volume
+                )
             except Exception as e:
                 last_error = e
         raise last_error or ValueError("No boolean engine available for difference")
@@ -226,7 +233,9 @@ def boolean_op(
         last_error = None
         for candidate in engines_to_try:
             try:
-                return trimesh.boolean.intersection(list(meshes), engine=candidate)
+                return trimesh.boolean.intersection(
+                    list(meshes), engine=candidate, check_volume=check_volume
+                )
             except Exception as e:
                 last_error = e
         raise last_error or ValueError("No boolean engine available for intersection")

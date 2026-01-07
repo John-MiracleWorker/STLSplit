@@ -16,7 +16,7 @@ class BuildVolume:
 
 @dataclass(frozen=True)
 class ConnectorConfig:
-    style: str = "auto"  # auto, hex, dovetail, magnet, none
+    style: str = "auto"  # auto, hex, dovetail, magnet, lip, none
     tolerance_mm: float = 0.15
     peg_radius_mm: float = 4.0
     peg_depth_mm: float = 8.0
@@ -26,6 +26,10 @@ class ConnectorConfig:
     dovetail_angle_deg: float = 20.0
     magnet_radius_mm: float = 3.05  # Standard 6mm magnet + tolerance
     magnet_depth_mm: float = 3.2    # Standard 3mm magnet + tolerance
+    # Lip & Groove (for thin-walled models like helmets)
+    lip_height_mm: float = 2.0      # How far the lip protrudes from cut plane
+    lip_width_mm: float = 1.5       # Thickness of the lip edge
+    thin_wall_threshold: float = 0.15  # Compactness threshold for auto-detection
 
 
 @dataclass(frozen=True)
@@ -98,6 +102,15 @@ class AppConfig:
                 ),
                 magnet_depth_mm=float(
                     connectors.get("magnet_depth_mm", ConnectorConfig.magnet_depth_mm)
+                ),
+                lip_height_mm=float(
+                    connectors.get("lip_height_mm", ConnectorConfig.lip_height_mm)
+                ),
+                lip_width_mm=float(
+                    connectors.get("lip_width_mm", ConnectorConfig.lip_width_mm)
+                ),
+                thin_wall_threshold=float(
+                    connectors.get("thin_wall_threshold", ConnectorConfig.thin_wall_threshold)
                 ),
             ),
             split=SplitConfig(

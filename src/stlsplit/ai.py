@@ -1,10 +1,3 @@
-try:
-    from google import genai
-    from google.genai import types
-except ImportError:
-    # Fallback for older installations
-    import google.generativeai as genai
-    types = None
 import matplotlib.pyplot as plt
 import numpy as np
 import trimesh
@@ -12,6 +5,27 @@ import io
 import os
 from PIL import Image
 from typing import List, Optional, Dict, Any
+
+# Try new API first, then fall back to old
+_USE_NEW_API = False
+genai = None
+types = None
+
+try:
+    from google import genai as _genai
+    from google.genai import types as _types
+    genai = _genai
+    types = _types
+    _USE_NEW_API = True
+except ImportError:
+    try:
+        import google.generativeai as _genai
+        genai = _genai
+        _USE_NEW_API = False
+    except ImportError:
+        pass
+
+
 
 def generate_cut_preview(mesh: trimesh.Trimesh, axis: int, position: float) -> Image.Image:
     """
@@ -64,13 +78,10 @@ def rank_cuts_with_gemini(
     Sends candidates to Gemini and returns the index of the best one.
     candidates: List of dicts with 'axis', 'pos', 'score' (math score)
     """
-    if not api_key:
+    if not api_key or genai is None:
         return 0 # Fallback to math best
         
     try:
-        # New API: use Client
-        client = genai.Client(api_key=api_key)
-        
         prompt_parts = [
             "You are an expert 3D printing engineer.",
             "I need to split this object into two parts to fit it in a printer.",
@@ -82,30 +93,46 @@ def rank_cuts_with_gemini(
             "Which cut is the BEST? Return ONLY the integer index (0, 1, 2...)."
         ]
         
-        contents = ["\n".join(prompt_parts)]
+        prompt_text = "\n".join(prompt_parts)
         
+        # Prepare images
+        image_parts = []
         for i, cand in enumerate(candidates):
             img = generate_cut_preview(mesh, cand['axis'], cand['pos'])
-            # Convert PIL image to bytes
             buf = io.BytesIO()
             img.save(buf, format='PNG')
             buf.seek(0)
-            
-            contents.append(f"Image {i} (Index {i}):")
-            if types is not None:
-                contents.append(types.Part.from_bytes(data=buf.getvalue(), mime_type="image/png"))
-            else:
-                # Fallback for old API
-                contents.append({"mime_type": "image/png", "data": buf.getvalue()})
-            
-        if len(contents) <= 1:
+            image_parts.append((f"Image {i} (Index {i}):", buf.getvalue()))
+        
+        if not image_parts:
             return 0
 
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=contents
-        )
-        text = response.text.strip()
+        if _USE_NEW_API:
+            # New API: use Client
+            client = genai.Client(api_key=api_key)
+            contents = [prompt_text]
+            for label, img_bytes in image_parts:
+                contents.append(label)
+                contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/png"))
+            
+            response = client.models.generate_content(
+                model="gemini-3-flash-preview",
+                contents=contents
+            )
+            text = response.text.strip()
+        else:
+            # Old API: configure + GenerativeModel
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel("gemini-3-flash-preview")
+            
+            # Build content for old API
+            contents = [prompt_text]
+            for label, img_bytes in image_parts:
+                contents.append(label)
+                contents.append({"mime_type": "image/png", "data": img_bytes})
+            
+            response = model.generate_content(contents)
+            text = response.text.strip()
         
         # Parse integer
         import re
@@ -185,7 +212,7 @@ def recommend_connector_with_gemini(
     """
     Uses Gemini to look at the section shape and recommend a connector.
     """
-    if not api_key:
+    if not api_key or genai is None:
         return "hex" # Default fallback
         
     if len(section_vertices) < 3:
@@ -196,9 +223,6 @@ def recommend_connector_with_gemini(
         return "hex"
 
     try:
-        # New API usage
-        client = genai.Client(api_key=api_key)
-        
         prompt_text = (
             "Analyze this 2D cross-section of a 3D printed part cut. "
             "Recommend the best connector type to join these parts. "
@@ -212,15 +236,25 @@ def recommend_connector_with_gemini(
         # Convert buffer to bytes for the API
         image_bytes = buf.getvalue()
         
-        response = client.models.generate_content(
-            model="gemini-2.0-flash", # Using the newer model if available, or fallback
-            contents=[
+        if _USE_NEW_API:
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model="gemini-3-flash-preview",
+                contents=[
+                    prompt_text,
+                    types.Part.from_bytes(data=image_bytes, mime_type="image/png")
+                ]
+            )
+            text = response.text.strip().lower()
+        else:
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel("gemini-3-flash-preview")
+            response = model.generate_content([
                 prompt_text,
-                types.Part.from_bytes(data=image_bytes, mime_type="image/png")
-            ]
-        )
+                {"mime_type": "image/png", "data": image_bytes}
+            ])
+            text = response.text.strip().lower()
         
-        text = response.text.strip().lower()
         print(f"Gemini connector recommendation: {text}")
         
         if "dovetail" in text: return "dovetail"
@@ -297,7 +331,7 @@ def analyze_model_for_splitting(
     - 'avoid_areas': list of {'description': str}
     - 'connector_recommendations': {'default': 'hex'/'dovetail'/'magnet'}
     """
-    if not api_key:
+    if not api_key or genai is None:
         return {'model_type': 'unknown', 'suggested_cuts': [], 'avoid_areas': [], 'connector_recommendations': {'default': 'hex'}}
     
     try:
@@ -305,8 +339,6 @@ def analyze_model_for_splitting(
         buf = io.BytesIO()
         preview.save(buf, format='PNG')
         buf.seek(0)
-        
-        client = genai.Client(api_key=api_key)
         
         bounds = mesh.bounds
         extents = bounds[1] - bounds[0]
@@ -335,15 +367,27 @@ POSITION_PCT: 0.0 = min, 0.5 = center, 1.0 = max
 
 Return ONLY valid JSON, no markdown."""
 
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=[
+        image_bytes = buf.getvalue()
+
+        if _USE_NEW_API:
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model="gemini-3-flash-preview",
+                contents=[
+                    prompt,
+                    types.Part.from_bytes(data=image_bytes, mime_type="image/png")
+                ]
+            )
+            text = response.text.strip()
+        else:
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel("gemini-3-flash-preview")
+            response = model.generate_content([
                 prompt,
-                types.Part.from_bytes(data=buf.getvalue(), mime_type="image/png")
-            ]
-        )
+                {"mime_type": "image/png", "data": image_bytes}
+            ])
+            text = response.text.strip()
         
-        text = response.text.strip()
         print(f"AI Model Analysis: {text[:200]}...")
         
         # Parse JSON
