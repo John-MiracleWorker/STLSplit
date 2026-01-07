@@ -23,65 +23,57 @@ def load_mesh(path: Path) -> trimesh.Trimesh:
     return mesh
 
 
-def repair_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+def repair_mesh(mesh: trimesh.Trimesh, mode: str = "light") -> trimesh.Trimesh:
     """
     Attempts to make a mesh watertight and manifold.
     Uses pymeshfix for aggressive repair if available.
     """
     fixed = mesh.copy()
-    original_is_volume = fixed.is_volume
-    
-    # Try pymeshfix first (most aggressive repair)
-    try:
-        import pymeshfix
-        import pyvista as pv
-        
-        # Convert trimesh to pyvista
-        faces_with_counts = np.hstack([
-            np.full((len(fixed.faces), 1), 3, dtype=np.int64),
-            fixed.faces
-        ])
-        pv_mesh = pv.PolyData(fixed.vertices, faces_with_counts)
-        
-        # Run pymeshfix
-        meshfix = pymeshfix.MeshFix(pv_mesh)
-        meshfix.repair(verbose=False)
-        repaired_pv = meshfix.mesh
-        
-        # Convert back to trimesh
-        if repaired_pv is not None and repaired_pv.n_cells > 0:
-            # Extract faces from pyvista format
-            faces_flat = repaired_pv.faces
-            # Reshape: pyvista stores [n_verts, v0, v1, v2, n_verts, v0, v1, v2, ...]
-            n_faces = repaired_pv.n_cells
-            faces = faces_flat.reshape(-1, 4)[:, 1:4]
-            fixed = trimesh.Trimesh(
-                vertices=repaired_pv.points,
-                faces=faces
-            )
-            fixed.process(validate=True)
-            if fixed.is_volume:
-                return fixed
-            else:
-                # PyMeshFix didn't make it a volume, try voxel remeshing
-                pass
-    except Exception as e:
-        pass  # Fall back to standard repair
-    
-    # Try convex hull for very broken meshes (last resort before standard repair)
-    # This is aggressive but ensures a volume
-    if not fixed.is_volume:
+    if mode == "none":
+        return fixed
+
+    if mode == "aggressive":
+        # Try pymeshfix first (most aggressive repair)
         try:
-            # Try filling holes more aggressively
-            fixed = mesh.copy()
-            fixed.fill_holes()
-            fixed.process(validate=True)
-            if fixed.is_volume:
-                return fixed
+            import pymeshfix
+            import pyvista as pv
+
+            # Convert trimesh to pyvista
+            faces_with_counts = np.hstack(
+                [np.full((len(fixed.faces), 1), 3, dtype=np.int64), fixed.faces]
+            )
+            pv_mesh = pv.PolyData(fixed.vertices, faces_with_counts)
+
+            # Run pymeshfix
+            meshfix = pymeshfix.MeshFix(pv_mesh)
+            meshfix.repair(verbose=False)
+            repaired_pv = meshfix.mesh
+
+            # Convert back to trimesh
+            if repaired_pv is not None and repaired_pv.n_cells > 0:
+                # Extract faces from pyvista format
+                faces_flat = repaired_pv.faces
+                # Reshape: pyvista stores [n_verts, v0, v1, v2, n_verts, v0, v1, v2, ...]
+                faces = faces_flat.reshape(-1, 4)[:, 1:4]
+                fixed = trimesh.Trimesh(vertices=repaired_pv.points, faces=faces)
+                fixed.process(validate=True)
+                if fixed.is_volume:
+                    return fixed
         except Exception:
-            pass
-    
-    # Standard trimesh repair (fallback)
+            pass  # Fall back to standard repair
+
+        # Try fill holes if still non-volume (aggressive, but cheaper than hull)
+        if not fixed.is_volume:
+            try:
+                fixed = mesh.copy()
+                fixed.fill_holes()
+                fixed.process(validate=True)
+                if fixed.is_volume:
+                    return fixed
+            except Exception:
+                pass
+
+    # Standard trimesh repair (lightweight)
     fixed = mesh.copy()
     try:
         fixed.remove_infinite_values()
@@ -92,18 +84,7 @@ def repair_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
         trimesh.repair.fill_holes(fixed)
     except Exception:
         pass
-    
-    # Standard trimesh repair (fallback)
-    try:
-        fixed.remove_infinite_values()
-        fixed.remove_unreferenced_vertices()
-        trimesh.repair.fix_inversion(fixed)
-        trimesh.repair.fix_winding(fixed)
-        trimesh.repair.fix_normals(fixed)
-        trimesh.repair.fill_holes(fixed)
-    except Exception:
-        pass
-        
+
     # Process removes NaNs, merges vertices, and if validate=True:
     # removes degenerate/duplicate faces and ensures consistent winding.
     fixed.process(validate=True)
@@ -168,7 +149,10 @@ def optimize_orientation(
 
 
 def split_mesh_by_plane(
-    mesh: trimesh.Trimesh, plane_origin: np.ndarray, plane_normal: np.ndarray
+    mesh: trimesh.Trimesh,
+    plane_origin: np.ndarray,
+    plane_normal: np.ndarray,
+    repair_mode: str = "light",
 ) -> Tuple[trimesh.Trimesh, trimesh.Trimesh]:
     tri_engine = pick_triangulation_engine()
     positive = trimesh.intersections.slice_mesh_plane(
@@ -188,9 +172,9 @@ def split_mesh_by_plane(
     
     # Use aggressive repair to ensure watertight volumes
     if positive is not None:
-        positive = repair_mesh(positive)
+        positive = repair_mesh(positive, mode=repair_mode)
     if negative is not None:
-        negative = repair_mesh(negative)
+        negative = repair_mesh(negative, mode=repair_mode)
         
     return positive, negative
 

@@ -8,7 +8,14 @@ import shutil
 import platform
 import matplotlib.pyplot as plt
 
-from stlsplit.config import AppConfig, BuildVolume, ConnectorConfig, SplitConfig, OutputConfig
+from stlsplit.config import (
+    AppConfig,
+    BuildVolume,
+    ConnectorConfig,
+    OutputConfig,
+    RepairConfig,
+    SplitConfig,
+)
 from stlsplit.pipeline import run_pipeline
 
 def _load_preview_mesh(infile: Path):
@@ -146,7 +153,8 @@ if uploaded_file:
                         use_ai=use_ai,
                         ai_key=api_key
                     ),
-                    output=OutputConfig(format="3mf", engine="manifold")
+                    output=OutputConfig(format="3mf", engine="manifold"),
+                    repair=RepairConfig(mode="light"),
                 )
                 
                 out_dir = Path(tempfile.mkdtemp())
@@ -154,7 +162,7 @@ if uploaded_file:
                 
                 res = run_pipeline(
                     infile, outfile, cfg, 
-                    repair=True, orient=True, 
+                    repair_mode=cfg.repair.mode, orient=True,
                     add_connectors=(conn_style!="none")
                 )
                 

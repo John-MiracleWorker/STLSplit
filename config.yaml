@@ -20,3 +20,5 @@ split:
 output:
   format: 3mf
   engine: manifold
+repair:
+  mode: light

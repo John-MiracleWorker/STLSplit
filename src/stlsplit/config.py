@@ -50,11 +50,17 @@ class OutputConfig:
 
 
 @dataclass(frozen=True)
+class RepairConfig:
+    mode: str = "light"  # none, light, aggressive
+
+
+@dataclass(frozen=True)
 class AppConfig:
     build_volume: BuildVolume = BuildVolume()
     connectors: ConnectorConfig = ConnectorConfig()
     split: SplitConfig = SplitConfig()
     output: OutputConfig = OutputConfig()
+    repair: RepairConfig = RepairConfig()
 
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> "AppConfig":
@@ -62,6 +68,7 @@ class AppConfig:
         connectors = data.get("connectors", {})
         split = data.get("split", {})
         output = data.get("output", {})
+        repair = data.get("repair", {})
         return AppConfig(
             build_volume=BuildVolume(
                 x_mm=float(build.get("x_mm", BuildVolume.x_mm)),
@@ -117,6 +124,9 @@ class AppConfig:
             output=OutputConfig(
                 format=str(output.get("format", OutputConfig.format)),
                 engine=str(output.get("engine", OutputConfig.engine)),
+            ),
+            repair=RepairConfig(
+                mode=str(repair.get("mode", RepairConfig.mode)),
             ),
         )
 

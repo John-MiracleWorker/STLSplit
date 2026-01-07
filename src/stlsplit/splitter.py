@@ -120,6 +120,7 @@ def split_to_fit(
     connector_cfg: ConnectorConfig,
     engine: str,
     add_connectors: bool,
+    repair_mode: str = "light",
 ) -> List[trimesh.Trimesh]:
     pieces: List[trimesh.Trimesh] = []
     queue: List[Tuple[trimesh.Trimesh, int]] = [(mesh, 0)]
@@ -195,7 +196,10 @@ def split_to_fit(
                 pass
 
             pos_mesh, neg_mesh = split_mesh_by_plane(
-                current, candidate.plane.origin, candidate.plane.normal
+                current,
+                candidate.plane.origin,
+                candidate.plane.normal,
+                repair_mode=repair_mode,
             )
             
             if pos_mesh is None or neg_mesh is None:
@@ -237,6 +241,7 @@ def split_to_fit(
                     engine,
                     label=label_str,
                     ai_key=split_cfg.ai_key,
+                    repair_mode=repair_mode,
                     section_vertices=section_vertices,
                     section_area=section_area,
                     section_path=section_path,

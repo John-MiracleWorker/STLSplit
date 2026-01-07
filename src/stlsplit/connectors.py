@@ -133,12 +133,12 @@ def _section_bbox_area(
     extents_uv = coords.max(axis=0) - coords.min(axis=0)
     return float(extents_uv[0] * extents_uv[1])
 
-def _ensure_volume(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+def _ensure_volume(mesh: trimesh.Trimesh, repair_mode: str = "light") -> trimesh.Trimesh:
     if mesh.is_volume:
         return mesh
     fixed = mesh.copy()
     try:
-        fixed = repair_mesh(fixed)
+        fixed = repair_mesh(fixed, mode=repair_mode)
     except Exception:
         pass
     if not fixed.is_volume:
@@ -268,6 +268,7 @@ def apply_connectors(
     engine: str,
     label: Optional[str] = None,
     ai_key: Optional[str] = None,
+    repair_mode: str = "light",
     section_vertices: Optional[np.ndarray] = None,
     section_area: Optional[float] = None,
     section_path: Optional[trimesh.path.Path3D] = None,
@@ -412,15 +413,15 @@ def apply_connectors(
         
         # Apply aggressive repair using PyMeshFix (if available)
         print("DEBUG: Repairing meshes for boolean operations...")
-        pos_mesh = repair_mesh(pos_mesh)
-        neg_mesh = repair_mesh(neg_mesh)
+        pos_mesh = repair_mesh(pos_mesh, mode=repair_mode)
+        neg_mesh = repair_mesh(neg_mesh, mode=repair_mode)
         print(f"DEBUG: pos_mesh.is_volume={pos_mesh.is_volume}, neg_mesh.is_volume={neg_mesh.is_volume}")
 
         peg_comb = trimesh.util.concatenate(pegs)
         sock_comb = trimesh.util.concatenate(sockets)
 
-        peg_comb = _ensure_volume(peg_comb)
-        sock_comb = _ensure_volume(sock_comb)
+        peg_comb = _ensure_volume(peg_comb, repair_mode=repair_mode)
+        sock_comb = _ensure_volume(sock_comb, repair_mode=repair_mode)
 
         # Try multiple boolean engines
         engines_to_try = [engine, "blender", "scad"]

@@ -25,15 +25,15 @@ def run_pipeline(
     input_path: Path,
     output_path: Path,
     config: AppConfig,
-    repair: bool = True,
+    repair_mode: str = "light",
     orient: bool = True,
     add_connectors: bool = True,
 ) -> PipelineResult:
     mesh = load_mesh(input_path)
     input_stats = analyze_mesh(mesh)
 
-    if repair:
-        mesh = repair_mesh(mesh)
+    if repair_mode != "none":
+        mesh = repair_mesh(mesh, mode=repair_mode)
     repaired_stats = analyze_mesh(mesh)
 
     if orient:
@@ -48,6 +48,7 @@ def run_pipeline(
         config.connectors,
         config.output.engine,
         add_connectors,
+        repair_mode=repair_mode,
     )
 
     # Smart Layout (God-Tier Feature)

@@ -6,7 +6,15 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
-from .config import AppConfig, ConnectorConfig, OutputConfig, SplitConfig, BuildVolume, load_config
+from .config import (
+    AppConfig,
+    BuildVolume,
+    ConnectorConfig,
+    OutputConfig,
+    RepairConfig,
+    SplitConfig,
+    load_config,
+)
 from .pipeline import run_pipeline
 
 
@@ -27,6 +35,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-depth", type=int, help="Max recursive split depth")
     parser.add_argument("--max-pieces", type=int, help="Max pieces (0 = unlimited)")
     parser.add_argument("--orient-step", type=int, help="Orientation step degrees (e.g., 90)")
+    parser.add_argument(
+        "--repair-mode",
+        choices=["none", "light", "aggressive"],
+        help="Repair mode for mesh cleanup",
+    )
     parser.add_argument("--no-repair", action="store_true", help="Skip mesh repair")
     parser.add_argument("--no-orient", action="store_true", help="Skip orientation optimization")
     parser.add_argument("--no-connectors", action="store_true", help="Skip connector generation")
@@ -76,7 +89,19 @@ def apply_overrides(config: AppConfig, args: argparse.Namespace) -> AppConfig:
     if args.engine:
         output = OutputConfig(format=output.format, engine=args.engine)
 
-    return AppConfig(build_volume=build, connectors=connectors, split=split, output=output)
+    repair = config.repair
+    if args.repair_mode:
+        repair = RepairConfig(mode=args.repair_mode)
+    if args.no_repair:
+        repair = RepairConfig(mode="none")
+
+    return AppConfig(
+        build_volume=build,
+        connectors=connectors,
+        split=split,
+        output=output,
+        repair=repair,
+    )
 
 
 def main() -> None:
@@ -97,7 +122,7 @@ def main() -> None:
         args.input,
         output_path,
         config,
-        repair=not args.no_repair,
+        repair_mode=config.repair.mode,
         orient=not args.no_orient,
         add_connectors=not args.no_connectors and config.connectors.style != "none",
     )
