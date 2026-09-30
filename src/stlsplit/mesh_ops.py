@@ -112,11 +112,31 @@ def repair_mesh(mesh: trimesh.Trimesh, mode: str = "light") -> trimesh.Trimesh:
 
 
 def fits_build_volume(mesh: trimesh.Trimesh, build: BuildVolume) -> bool:
-    """ Checks if mesh fits anywhere in the build volume. """
+    """
+    Check if mesh fits the build volume in its print orientation.
+
+    Parts are printed flat: layout.orient_to_bed puts the SMALLEST extent
+    vertical (bed axis), so the footprint is the two larger extents. The
+    footprint may be rotated 90° on the bed.
+
+    NOTE: the old implementation compared sorted extents, which treated the
+    build box as if the part could be rotated into ANY orientation (e.g. a
+    181x246x60 part "fit" because 246 < 250 when stood on end). But the
+    layout always prints flat, so such parts ended up 246mm wide on a 220mm
+    plate. This version checks the orientation the part is actually printed
+    in, so "fits" always means "printable as arranged".
+    """
     extents = mesh.extents
-    # Build volume is X, Y, Z. We can rotate the object to fit.
-    # So we check if the sorted extents are <= sorted build dimensions.
-    return np.all(np.sort(extents) <= np.sort([build.x_mm, build.y_mm, build.z_mm]))
+    order = np.argsort(extents)
+    height = extents[order[0]]
+    f1 = extents[order[1]]
+    f2 = extents[order[2]]
+    if height > build.z_mm:
+        return False
+    tol = 1e-6
+    return (f1 <= build.x_mm + tol and f2 <= build.y_mm + tol) or (
+        f2 <= build.x_mm + tol and f1 <= build.y_mm + tol
+    )
 
 
 def iter_rotations(step_deg: int) -> Iterable[np.ndarray]:
@@ -168,12 +188,70 @@ def optimize_orientation(
     return oriented, transform
 
 
+def _manifold_to_trimesh(m) -> Optional[trimesh.Trimesh]:
+    """Convert a manifold3d.Manifold to a trimesh.Trimesh (None if empty)."""
+    if m is None or m.is_empty():
+        return None
+    raw = m.to_mesh()
+    faces = np.asarray(raw.tri_verts, dtype=np.int64)
+    verts = np.asarray(raw.vert_properties, dtype=np.float64)[:, :3]
+    if len(faces) == 0 or len(verts) == 0:
+        return None
+    return trimesh.Trimesh(vertices=verts, faces=faces, process=True)
+
+
+def _split_mesh_manifold(
+    mesh: trimesh.Trimesh,
+    plane_origin: np.ndarray,
+    plane_normal: np.ndarray,
+) -> Optional[Tuple[trimesh.Trimesh, trimesh.Trimesh]]:
+    """
+    Split via manifold3d CSG (split_by_plane). Constructive solid geometry
+    guarantees watertight children, unlike slice_mesh_plane whose capped
+    slices sometimes leave holes fill_holes cannot close (observed on
+    2nd-generation cuts of complex parts -> 'Not all meshes are volumes!'
+    in connector booleans).
+    Returns (positive_side, negative_side) or None if manifold is unusable.
+    The positive side is the one in the direction of plane_normal.
+    """
+    try:
+        import manifold3d as m3d
+        normal = np.asarray(plane_normal, dtype=np.float64)
+        origin = np.asarray(plane_origin, dtype=np.float64)
+        mm = m3d.Manifold(
+            m3d.Mesh(
+                np.ascontiguousarray(np.asarray(mesh.vertices, dtype=np.float32)),
+                np.ascontiguousarray(np.asarray(mesh.faces, dtype=np.uint32)),
+            )
+        )
+        first, second = mm.split_by_plane(normal, float(normal @ origin))
+        positive = _manifold_to_trimesh(first)
+        negative = _manifold_to_trimesh(second)
+        if positive is not None and negative is not None:
+            return positive, negative
+        return None
+    except Exception as e:
+        import traceback
+        print(f"DEBUG: manifold split failed: {e!r}")
+        traceback.print_exc(limit=3)
+        return None
+
+
 def split_mesh_by_plane(
     mesh: trimesh.Trimesh,
     plane_origin: np.ndarray,
     plane_normal: np.ndarray,
     repair_mode: str = "light",
 ) -> Tuple[trimesh.Trimesh, trimesh.Trimesh]:
+    # Preferred path: manifold3d CSG split -> watertight children guaranteed.
+    manifold_result = _split_mesh_manifold(mesh, plane_origin, plane_normal)
+    if manifold_result is not None:
+        positive, negative = manifold_result
+        if positive.is_watertight and negative.is_watertight:
+            return positive, negative
+        # manifold produced non-watertight (shouldn't happen); fall through
+        # to the slice path which may repair differently.
+
     tri_engine = pick_triangulation_engine()
     positive = trimesh.intersections.slice_mesh_plane(
         mesh,

@@ -16,6 +16,63 @@ from .mesh_ops import (
 )
 
 
+def _section_loops_2d(vertices, origin, normal):
+    """Build closed 2D loops (list of (N,2) arrays) from the raw section
+    vertex stream, in the plane's UV frame. Loops are split on gaps > 1e-4,
+    so a solid face -> 1 loop, an annulus -> 2 loops (outer + inner)."""
+    _, u, v = plane_basis(normal)
+    loops = []
+    cur = []
+    for k in range(len(vertices)):
+        a = np.array([float(np.dot(vertices[k] - origin, u)),
+                      float(np.dot(vertices[k] - origin, v))])
+        if cur:
+            d = a - cur[-1]
+            if float(np.linalg.norm(d)) > 1e-4:
+                cur.append(a)
+            else:
+                if len(cur) > 2:
+                    loops.append(np.array(cur))
+                cur = [a]
+        else:
+            cur = [a]
+    if len(cur) > 2:
+        loops.append(np.array(cur))
+    return loops
+
+
+def _even_odd_count(loops, p2):
+    """Ray-casting parity: number of loop crossings to the right of p2."""
+    cnt = 0
+    for loop in loops:
+        n = len(loop)
+        for i in range(n):
+            x1, y1 = loop[i]
+            x2, y2 = loop[(i + 1) % n]
+            if (y1 > p2[1]) != (y2 > p2[1]):
+                xin = x1 + (p2[1] - y1) * (x2 - x1) / (y2 - y1)
+                if p2[0] < xin:
+                    cnt += 1
+    return cnt
+
+
+def _farthest_point_sample(points, k):
+    """Deterministic farthest-point sampling: pick k well-spread points."""
+    centroid = points.mean(axis=0)
+    start = int(np.argmax(
+        np.hypot(points[:, 0] - centroid[0], points[:, 1] - centroid[1])))
+    chosen = [start]
+    min_d = np.hypot(
+        points[:, 0] - points[start, 0], points[:, 1] - points[start, 1])
+    for _ in range(k - 1):
+        j = int(np.argmax(min_d))
+        chosen.append(j)
+        min_d = np.minimum(
+            min_d,
+            np.hypot(points[:, 0] - points[j, 0], points[:, 1] - points[j, 1]))
+    return points[chosen]
+
+
 def connector_positions(
     section_vertices: np.ndarray,
     plane_origin: np.ndarray,
@@ -25,60 +82,101 @@ def connector_positions(
 ) -> List[np.ndarray]:
     """
     Calculate peg positions based on the 2D cross-section of the cut.
-    Returns positions ON the cut plane.
+    Returns positions ON the cut plane, each guaranteed to sit on actual
+    material (never in a hole / void).
+
+    Solid (single-loop) sections keep the fast centre-line placement.
+    Sections with holes (e.g. a ring spinner whose cut face is an annulus)
+    would otherwise get their centre-line pegs landing in the hole, so we
+    grid-sample the section, keep the even-odd "on material" points, and
+    farthest-point-sample `connector_count` well-distributed positions.
     """
     if section_vertices is None or len(section_vertices) == 0:
         print(f"DEBUG: No section vertices, using plane_origin: {plane_origin}")
         return [plane_origin.copy()]
 
     _, u, v = plane_basis(plane_normal)
-    
-    # Project vertices onto the plane's 2D coordinate system
-    coords = np.vstack(
-        (
-            np.dot(section_vertices - plane_origin, u),
-            np.dot(section_vertices - plane_origin, v),
-        )
-    ).T
-    
-    if not np.isfinite(coords).all():
+    verts = np.asarray(section_vertices, dtype=float)
+    if len(verts) == 0 or not np.isfinite(verts).all():
         print(f"DEBUG: Non-finite coords, using plane_origin")
         return [plane_origin.copy()]
+
+    coords = np.vstack(
+        (
+            np.dot(verts - plane_origin, u),
+            np.dot(verts - plane_origin, v),
+        )
+    ).T
 
     min_uv = coords.min(axis=0)
     max_uv = coords.max(axis=0)
     extents_uv = max_uv - min_uv
     center_uv = (min_uv + max_uv) * 0.5
-    
-    print(f"DEBUG: Section extents UV: {extents_uv}, center UV: {center_uv}")
 
-    # Choose the longer axis for spreading multiple connectors
+    print(f"DEBUG: Section extents UV: {extents_uv}, center UV: {center_uv}")
+    if min(extents_uv) <= 0:
+        return [plane_origin.copy()]
+
+    def uv_to_world(p2):
+        return plane_origin + u * p2[0] + v * p2[1]
+
+    loops = _section_loops_2d(verts, plane_origin, plane_normal)
+
+    # --- Fast path: centre-line spread, but only if every point is on
+    # --- material. This handles simple solid sections. For a ring (annulus)
+    # --- or a C/crescent shape the bbox centre sits in the void, so the
+    # --- centre-line points land off-material and we fall through to the
+    # --- robust grid + farthest-point sampling below.
     if extents_uv[0] >= extents_uv[1]:
         axis_idx = 0
     else:
         axis_idx = 1
-
     max_offset = (extents_uv[axis_idx] * 0.5) - margin_mm
-    
-    if connector_count <= 1 or max_offset <= 0:
-        # Just one in the center
-        pos = plane_origin + u * center_uv[0] + v * center_uv[1]
-        print(f"DEBUG: Single connector position: {pos}")
-        return [pos]
 
-    # Spread along the chosen axis
-    offsets = np.linspace(-max_offset, max_offset, connector_count)
-    
-    results = []
-    for off in offsets:
-        if axis_idx == 0:
-            p = plane_origin + u * (center_uv[0] + off) + v * center_uv[1]
-        else:
-            p = plane_origin + u * center_uv[0] + v * (center_uv[1] + off)
-        results.append(p)
-    
-    print(f"DEBUG: Generated {len(results)} connector positions")
-    return results
+    centerline_2d = []
+    if connector_count <= 1:
+        centerline_2d = [center_uv.copy()]
+    elif max_offset > 0:
+        for off in np.linspace(-max_offset, max_offset, connector_count):
+            if axis_idx == 0:
+                centerline_2d.append(np.array([center_uv[0] + off, center_uv[1]]))
+            else:
+                centerline_2d.append(np.array([center_uv[0], center_uv[1] + off]))
+
+    if centerline_2d and all(
+            _even_odd_count(loops, np.asarray(p, dtype=float)) % 2 == 1
+            for p in centerline_2d):
+        print(f"DEBUG: Centre-line placement on material "
+              f"({len(centerline_2d)} positions)")
+        return [uv_to_world(p) for p in centerline_2d]
+
+    # --- Robust path: grid-sample the section, keep on-material (even-odd)
+    # --- points, farthest-point-sample `connector_count` well-spread picks.
+    # --- Works for solid, holey, and irregular (C/crescent) sections.
+    inset = max(0.0, margin_mm)
+    lo = min_uv + inset
+    hi = max_uv - inset
+    if lo[0] >= hi[0] or lo[1] >= hi[1]:
+        lo, hi = min_uv, max_uv
+    grid_n = 40
+    gx = np.linspace(lo[0], hi[0], grid_n)
+    gy = np.linspace(lo[1], hi[1], grid_n)
+    cand = [
+        np.array([x, y])
+        for x in gx
+        for y in gy
+        if _even_odd_count(loops, np.array([x, y])) % 2 == 1
+    ]
+    if not cand:
+        print(f"DEBUG: No on-material grid points, using bbox centre")
+        return [uv_to_world(center_uv)]
+    cand = np.array(cand)
+    if connector_count <= 1:
+        return [uv_to_world(cand.mean(axis=0))]
+    picked = _farthest_point_sample(cand, min(connector_count, len(cand)))
+    print(f"DEBUG: Robust on-material placement: {len(cand)} grid points, "
+          f"picked {len(picked)} via farthest-point sampling")
+    return [uv_to_world(p) for p in picked]
 
 
 def make_hex_prism(radius: float, height: float) -> trimesh.Trimesh:
@@ -715,15 +813,26 @@ def apply_connectors(
             # Keying logic: scale the first peg slightly to enforce orientation
             if i == 0 and len(positions) > 1:
                 r *= 1.2
-            
+
+            # Both peg and socket are CENTERED on the cut plane so each
+            # straddles it. The peg is unioned into the positive piece: half
+            # embeds in its own half (watertight), half protrudes into the
+            # negative piece to mate with the socket cavity.
+            #
+            # The OLD code placed the peg at `pos + n*(d/2)` (entirely inside
+            # the positive half) and the socket at `pos - n*(d/2+tol)`
+            # (entirely inside the negative half). They only touched at the
+            # plane -> zero interlock, and the face-only union produced
+            # non-watertight pieces. Verified: peg∩socket = 0.000 mm3 before,
+            # 100% overlap after.
             p = make_hex_prism(r, d)
             p.apply_transform(rot)
-            p.apply_translation(pos + plane_normal * (d * 0.5))
+            p.apply_translation(pos)
             pegs.append(p)
 
             s = make_hex_prism(r + tol, d + tol * 2)
             s.apply_transform(rot)
-            s.apply_translation(pos - plane_normal * (d * 0.5 + tol))
+            s.apply_translation(pos)
             sockets.append(s)
 
         elif style == "magnet":

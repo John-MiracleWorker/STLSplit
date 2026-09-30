@@ -87,10 +87,20 @@ def choose_cut_plane(
     if not candidate_list:
         return None
 
-    # Sort by math score (ascending is better? No, let's check score formula)
-    # Roughness * weight (we want low) + Density * weight (low) - Support * weight (high area -> big negative -> low score)
-    # So LOWER score is better.
-    candidate_list.sort(key=lambda x: x["score"])
+    # Prefer cuts that split the oversized axis in HALF (balanced binary
+    # split), using the surface score only as a tiebreaker. The old
+    # pure-score ordering peeled uneven caps (e.g. 61 mm slabs) and left
+    # long strips that were never bisected along the other axis, so final
+    # pieces stayed far larger than the build volume. A balanced split is
+    # also what guarantees the cut tree actually converges to pieces that
+    # fit: halving each oversized axis per generation bounds the depth.
+    def balance(cand):
+        return max(
+            cand["pos"] - bounds_min[cand["axis"]],
+            bounds_max[cand["axis"]] - cand["pos"],
+        )
+
+    candidate_list.sort(key=lambda c: (round(balance(c), 1), c["score"]))
     
     # Build alternatives list from remaining candidates
     def make_decision(cand, alts=None):
@@ -339,188 +349,175 @@ def split_helmet(
     ai_key: Optional[str] = None,
 ) -> List[trimesh.Trimesh]:
     """
-    Helmet-specific splitting that checks ALL dimensions (X, Y, Z).
-    Uses edge-based dovetail connectors for thin walls when connectors are enabled.
-    
-    Strategy:
-    1. Check which dimensions exceed build volume
-    2. For width/depth (X/Y): use vertical cuts through center
-    3. For height (Z): use horizontal cuts
-    4. Apply edge dovetails for alignment (optional)
+    Helmet-specific splitting using a work queue.
+
+    Every piece that does not fit the build volume (in its flat print
+    orientation, per fits_build_volume) is cut once along its worst oversized
+    axis, and the two children are re-examined until every piece fits or a
+    safety budget is exhausted. This replaces the old single-pass-per-axis
+    design capped at 2 cuts, which left oversized children unexamined and
+    silently produced pieces larger than the build volume.
+
+    Uses edge-based dovetail connectors for thin walls when connectors are
+    enabled (holes in thin walls are fragile; edge tabs are not).
     """
     bounds_min, bounds_max = mesh.bounds
     extents = bounds_max - bounds_min
     build_dims = np.array([build.x_mm, build.y_mm, build.z_mm])
-    
+
     print(f"🪖 Helmet dimensions: {extents[0]:.1f} x {extents[1]:.1f} x {extents[2]:.1f} mm")
     print(f"🪖 Build volume: {build.x_mm:.1f} x {build.y_mm:.1f} x {build.z_mm:.1f} mm")
-    
-    # Check if already fits
-    if np.all(extents <= build_dims):
+
+    if fits_build_volume(mesh, build):
         print("🪖 Helmet already fits build volume!")
         return [mesh]
-    
-    # Determine which axes need cutting (prioritize largest overage first)
-    overage = extents - build_dims
-    oversized_axes = np.where(overage > 0)[0]
-    
-    if len(oversized_axes) == 0:
-        return [mesh]
-    
-    # Sort by overage amount (largest first)
-    oversized_axes = sorted(oversized_axes, key=lambda a: overage[a], reverse=True)
-    
-    print(f"🪖 Oversized axes: {', '.join([f'{chr(88+a)} by {overage[a]:.1f}mm' for a in oversized_axes])}")
-    
-    
+
     split_cfg = split_cfg or SplitConfig()
     use_dovetails = add_connectors and connector_cfg.style != "none"
     if not add_connectors:
         print("🪖 Helmet mode: connectors disabled")
     if use_dovetails and connector_cfg.style not in ("auto", "dovetail"):
-        print(
-            f"🪖 Helmet mode: forcing dovetail connectors (ignoring style '{connector_cfg.style}')"
-        )
+        print(f"🪖 Helmet mode: forcing dovetail connectors (ignoring style '{connector_cfg.style}')")
 
-    pieces = [mesh]
+    pieces: List[trimesh.Trimesh] = []
     seam_plates: List[trimesh.Trimesh] = []
     cut_counter = 0
-    
-    for axis in oversized_axes:
+    queue: List[trimesh.Trimesh] = [mesh]
+    max_iterations = 64  # safety cap against degenerate inputs
+
+    while queue:
+        piece = queue.pop(0)
+
+        if fits_build_volume(piece, build):
+            pieces.append(piece)
+            continue
+
+        if len(pieces) + len(queue) >= max_iterations:
+            print(f"⚠️  Cut budget exhausted; piece {np.round(piece.extents, 1)} kept as-is (will NOT fit build volume)")
+            pieces.append(piece)
+            continue
+
+        # Choose the axis to cut. Prefer axes where the raw extent exceeds the
+        # build box; otherwise (piece only fails the flat-print footprint
+        # check) cut the longest axis.
+        p_ext = piece.extents
+        oversize = [a for a in range(3) if p_ext[a] > build_dims[a] + 1e-6]
+        if oversize:
+            axis = max(oversize, key=lambda a: p_ext[a] - build_dims[a])
+        else:
+            axis = int(np.argsort(p_ext)[2])
+
         axis_name = ['X', 'Y', 'Z'][axis]
-        new_pieces = []
-        
-        for piece in pieces:
-            piece_bounds = piece.bounds
-            piece_extent = piece_bounds[1][axis] - piece_bounds[0][axis]
-            
-            # Check if this piece needs cutting on this axis
-            if piece_extent <= build_dims[axis]:
-                new_pieces.append(piece)
-                continue
-            
-            # Calculate number of cuts needed for this piece on this axis
-            num_cuts_needed = int(np.ceil(piece_extent / build_dims[axis])) - 1
-            num_cuts_needed = min(num_cuts_needed, 2)  # Max 2 cuts per axis = 3 pieces
-            
-            if num_cuts_needed == 0:
-                new_pieces.append(piece)
-                continue
-            
-            print(f"🪖 Cutting piece along {axis_name} axis ({num_cuts_needed} cut(s))")
-            
-            # Calculate cut positions using helmet heuristics
+        print(f"🪖 Cutting piece along {axis_name} axis (extent {p_ext[axis]:.1f}mm > build {build_dims[axis]:.1f}mm)")
+
+        try:
+            openings = detect_bbox_openings(piece)
+            if openings:
+                for (open_axis, side), ratio in openings.items():
+                    face = f"{['X','Y','Z'][open_axis]}{'min' if side < 0 else 'max'}"
+                    print(f"🪖 Opening detected at {face} (hit_ratio={ratio:.2f})")
+        except Exception:
+            openings = {}
+
+        roughness = face_roughness(piece)
+        curvature = face_gaussian_curvature(piece, split_cfg.curvature_band_mm)
+        cut_positions = select_helmet_cut_positions(
+            piece,
+            axis,
+            1,
+            split_cfg,
+            openings,
+            roughness,
+            curvature,
+        )
+        if not cut_positions:
+            print(f"⚠️  No cut position found for piece {np.round(p_ext, 1)}; kept as-is (will NOT fit build volume)")
+            pieces.append(piece)
+            continue
+
+        cut_pos = cut_positions[0]
+        piece_bounds = piece.bounds
+        origin = (piece_bounds[0] + piece_bounds[1]) / 2
+        origin[axis] = cut_pos
+        normal = np.zeros(3)
+        normal[axis] = 1.0
+
+        print(f"🪖 Cut at {axis_name}={cut_pos:.1f}mm")
+
+        section = None
+        section_vertices = None
+        if split_cfg.helmet_seam_plates and split_cfg.helmet_seam_width_mm > 0:
             try:
-                openings = detect_bbox_openings(piece)
-                if openings:
-                    for (open_axis, side), ratio in openings.items():
-                        face = f"{['X','Y','Z'][open_axis]}{'min' if side < 0 else 'max'}"
-                        print(f"🪖 Opening detected at {face} (hit_ratio={ratio:.2f})")
+                section = piece.section(plane_origin=origin, plane_normal=normal)
+                if section is not None:
+                    section_vertices = section.vertices
             except Exception:
-                openings = {}
-
-            roughness = face_roughness(piece)
-            curvature = face_gaussian_curvature(piece, split_cfg.curvature_band_mm)
-            cut_positions = select_helmet_cut_positions(
-                piece,
-                axis,
-                num_cuts_needed,
-                split_cfg,
-                openings,
-                roughness,
-                curvature,
-            )
-            
-            current = piece
-            for cut_pos in cut_positions:
-                # Create cut plane
-                origin = (piece_bounds[0] + piece_bounds[1]) / 2
-                origin[axis] = cut_pos
-                normal = np.zeros(3)
-                normal[axis] = 1.0
-                
-                print(f"🪖 Cut at {axis_name}={cut_pos:.1f}mm")
-
                 section = None
                 section_vertices = None
-                if split_cfg.helmet_seam_plates and split_cfg.helmet_seam_width_mm > 0:
-                    try:
-                        section = current.section(
-                            plane_origin=origin, plane_normal=normal
-                        )
-                        if section is not None:
-                            section_vertices = section.vertices
-                    except Exception:
-                        section = None
-                        section_vertices = None
 
-                pos_mesh, neg_mesh = split_mesh_by_plane(
-                    current, origin, normal, repair_mode=repair_mode
+        pos_mesh, neg_mesh = split_mesh_by_plane(piece, origin, normal, repair_mode=repair_mode)
+
+        if pos_mesh is None or neg_mesh is None:
+            print(f"⚠️  Cut failed; keeping piece as-is (will NOT fit build volume)")
+            pieces.append(piece)
+            continue
+
+        if len(pos_mesh.faces) == 0 or len(neg_mesh.faces) == 0:
+            print(f"⚠️  Cut produced empty mesh; keeping piece as-is (will NOT fit build volume)")
+            pieces.append(piece)
+            continue
+
+        # Try to repair meshes to make them watertight
+        if repair_mode != "none":
+            try:
+                pos_mesh.fill_holes()
+                pos_mesh.fix_normals()
+                neg_mesh.fill_holes()
+                neg_mesh.fix_normals()
+            except Exception:
+                pass
+
+        if (
+            split_cfg.helmet_seam_plates
+            and split_cfg.helmet_seam_width_mm > 0
+            and split_cfg.helmet_seam_thickness_mm > 0
+        ):
+            if section_vertices is not None and len(section_vertices) >= 3:
+                plate = make_seam_plate(
+                    section_path=section,
+                    section_vertices=section_vertices,
+                    plane_origin=origin,
+                    plane_normal=normal,
+                    plate_thickness=split_cfg.helmet_seam_thickness_mm,
+                    plate_width=split_cfg.helmet_seam_width_mm,
+                    engine=engine,
                 )
-                
-                if pos_mesh is None or neg_mesh is None:
-                    print(f"🪖 Cut failed, keeping piece as-is")
-                    continue
-                
-                if len(pos_mesh.faces) == 0 or len(neg_mesh.faces) == 0:
-                    print(f"🪖 Cut produced empty mesh, skipping")
-                    continue
-                
-                # Try to repair meshes to make them watertight
-                if repair_mode != "none":
-                    try:
-                        pos_mesh.fill_holes()
-                        pos_mesh.fix_normals()
-                        neg_mesh.fill_holes()
-                        neg_mesh.fix_normals()
-                    except Exception:
-                        pass
+                if plate is not None and len(plate.faces) > 0:
+                    seam_plates.append(plate)
+                    print("🪖 Seam plate added for this cut")
 
-                if (
-                    split_cfg.helmet_seam_plates
-                    and split_cfg.helmet_seam_width_mm > 0
-                    and split_cfg.helmet_seam_thickness_mm > 0
-                ):
-                    if section_vertices is not None and len(section_vertices) >= 3:
-                        plate = make_seam_plate(
-                            section_path=section,
-                            section_vertices=section_vertices,
-                            plane_origin=origin,
-                            plane_normal=normal,
-                            plate_thickness=split_cfg.helmet_seam_thickness_mm,
-                            plate_width=split_cfg.helmet_seam_width_mm,
-                            engine=engine,
-                        )
-                        if plate is not None and len(plate.faces) > 0:
-                            seam_plates.append(plate)
-                            print("🪖 Seam plate added for this cut")
-                
-                # Apply edge-based dovetail connectors (better for thin walls than holes)
-                # Dovetails interlock at the cut edge, not deep into the wall
-                if use_dovetails:
-                    try:
-                        print(f"🪖 Applying dovetail edge connectors...")
-                        cut_counter += 1
-                        pos_mesh, neg_mesh = apply_edge_dovetails(
-                            pos_mesh,
-                            neg_mesh,
-                            origin,
-                            normal,
-                            connector_cfg,
-                            engine,
-                            label_index=cut_counter,
-                            repair_mode=repair_mode,
-                        )
-                    except Exception as e:
-                        print(f"🪖 Dovetail connectors failed: {e}")
-                
-                new_pieces.append(neg_mesh)
-                current = pos_mesh
-            
-            new_pieces.append(current)
-        
-        pieces = new_pieces
-    
+        # Apply edge-based dovetail connectors (better for thin walls than holes)
+        # Dovetails interlock at the cut edge, not deep into the wall
+        if use_dovetails:
+            try:
+                print("🪖 Applying dovetail edge connectors...")
+                cut_counter += 1
+                pos_mesh, neg_mesh = apply_edge_dovetails(
+                    pos_mesh,
+                    neg_mesh,
+                    origin,
+                    normal,
+                    connector_cfg,
+                    engine,
+                    label_index=cut_counter,
+                    repair_mode=repair_mode,
+                )
+            except Exception as e:
+                print(f"🪖 Dovetail connectors failed: {e}")
+
+        queue.append(pos_mesh)
+        queue.append(neg_mesh)
+
     if seam_plates:
         pieces.extend(seam_plates)
 
@@ -928,9 +925,6 @@ def split_to_fit(
     add_connectors: bool,
     repair_mode: str = "light",
 ) -> List[trimesh.Trimesh]:
-    pieces: List[trimesh.Trimesh] = []
-    queue: List[Tuple[trimesh.Trimesh, int]] = [(mesh, 0)]
-    
     # Perform initial AI analysis of the full model if AI is enabled
     ai_analysis = None
     if split_cfg.use_ai and split_cfg.ai_key:
@@ -982,109 +976,446 @@ def split_to_fit(
             build,
             connector_cfg,
             engine,
-            add_connectors=False,
+            add_connectors=add_connectors,
             split_cfg=split_cfg,
             repair_mode=repair_mode,
             ai_key=split_cfg.ai_key if split_cfg.use_ai else None,
         )
 
-    while queue:
-        current, depth = queue.pop()
-        if fits_build_volume(current, build) or depth >= split_cfg.max_depth:
-            pieces.append(current)
-            continue
-        if split_cfg.max_pieces and (len(pieces) + len(queue) + 1) >= split_cfg.max_pieces:
-            pieces.append(current)
-            continue
+    # Phase 0: decompose the (possibly multi-body) model into single-shell
+    # bodies. CSG and point-containment tests are only sound on a single
+    # closed shell, so each body gets its own independent cut tree; the
+    # resulting pieces are concatenated. Overlapping shells (e.g. a spinner
+    # ring + bearing + cap) are separate parts that print and assemble.
+    bodies = [b for b in mesh.split(only_watertight=False)
+             if b.is_watertight and b.volume > 1.0]
+    if not bodies:
+        bodies = [mesh]
+    print(f"Model has {len(bodies)} body(ies)")
 
-        decision = choose_cut_plane(current, build, split_cfg)
-        if not decision:
-            pieces.append(current)
-            continue
+    def _process_body(body: trimesh.Trimesh) -> List[trimesh.Trimesh]:
+        """Phase 1 (cut clean leaves) + Phase 2 (connect seams) for one body."""
+        pieces: List[trimesh.Trimesh] = []
+        queue: List[Tuple[trimesh.Trimesh, int]] = [(body, 0)]
+        # ------------------------------------------------------------------
+        # Phase 1: cut the CLEAN mesh into leaves. No connectors are applied
+        # during cutting -- the old code applied connectors right after each
+        # cut and then re-cut the connector-attached child, so the next cut
+        # plane sliced through the previous cut's pegs/dovetails. That
+        # produced non-watertight children, which poisoned every downstream
+        # boolean ("Not all meshes are volumes!") and triggered the overlay
+        # fallback that concatenates overlapping solids.
+        #
+        # Phase 2 (below): once the cut tree is final, apply connectors along
+        # each recorded seam. Since leaves are never re-cut, no plane ever
+        # intersects a connector.
+        # ------------------------------------------------------------------
+        seams: List[dict] = []
+        while queue:
+            current, depth = queue.pop()
+            if fits_build_volume(current, build) or depth >= split_cfg.max_depth:
+                pieces.append(current)
+                continue
+            if split_cfg.max_pieces and (len(pieces) + len(queue) + 1) >= split_cfg.max_pieces:
+                pieces.append(current)
+                continue
 
-        # Try the chosen cut, but if it creates non-volume meshes, try alternatives
-        candidates_to_try = [decision]
-        
-        # Get additional candidates from choose_cut_plane's sorted list
-        # We store the top candidates in the decision for fallback
-        if hasattr(decision, 'alternatives') and decision.alternatives:
-            candidates_to_try.extend(decision.alternatives[:3])  # Try up to 3 alternatives
-        
-        best_pos = None
-        best_neg = None
-        best_decision = None
-        section_vertices = None
-        section_area = None
-        section_path = None
-        
-        for candidate in candidates_to_try:
-            try:
-                section = current.section(
-                    plane_origin=candidate.plane.origin, plane_normal=candidate.plane.normal
+            decision = choose_cut_plane(current, build, split_cfg)
+            if not decision:
+                pieces.append(current)
+                continue
+
+            # Try the chosen cut, but if it creates non-volume meshes, try alternatives
+            candidates_to_try = [decision]
+
+            # Get additional candidates from choose_cut_plane's sorted list
+            # We store the top candidates in the decision for fallback
+            if hasattr(decision, 'alternatives') and decision.alternatives:
+                candidates_to_try.extend(decision.alternatives[:3])  # Try up to 3 alternatives
+
+            best_pos = None
+            best_neg = None
+            best_decision = None
+            section_vertices = None
+            section_area = None
+            section_path = None
+
+            for candidate in candidates_to_try:
+                try:
+                    section = current.section(
+                        plane_origin=candidate.plane.origin, plane_normal=candidate.plane.normal
+                    )
+                    if section is not None:
+                        section_path = section
+                        section_vertices = section.vertices
+                        section_area = section.area
+                except Exception:
+                    pass
+
+                pos_mesh, neg_mesh = split_mesh_by_plane(
+                    current,
+                    candidate.plane.origin,
+                    candidate.plane.normal,
+                    repair_mode=repair_mode,
                 )
-                if section is not None:
-                    section_path = section
-                    section_vertices = section.vertices
-                    section_area = section.area
-            except Exception:
-                pass
 
-            pos_mesh, neg_mesh = split_mesh_by_plane(
-                current,
-                candidate.plane.origin,
-                candidate.plane.normal,
+                if pos_mesh is None or neg_mesh is None:
+                    continue
+                if len(pos_mesh.faces) == 0 or len(neg_mesh.faces) == 0:
+                    continue
+
+                # Check if both meshes are volumes (watertight)
+                if pos_mesh.is_volume and neg_mesh.is_volume:
+                    best_pos = pos_mesh
+                    best_neg = neg_mesh
+                    best_decision = candidate
+                    print(f"DEBUG: Found volume-safe cut at axis={candidate.axis}, pos={candidate.pos:.1f}")
+                    break
+                elif best_pos is None:
+                    # Keep first valid cut as fallback even if not volumes
+                    best_pos = pos_mesh
+                    best_neg = neg_mesh
+                    best_decision = candidate
+
+            if best_pos is None or best_neg is None:
+                pieces.append(current)
+                continue
+
+            # Record this seam (connectors deferred to Phase 2)
+            seams.append({
+                "origin": best_decision.plane.origin,
+                "normal": best_decision.plane.normal,
+                "section_vertices": section_vertices,
+                "section_area": section_area,
+                "section_path": section_path,
+                "label": f"P{depth}_{len(seams)}",
+            })
+
+            queue.append((best_pos, depth + 1))
+            queue.append((best_neg, depth + 1))
+
+        # ------------------------------------------------------------------
+        # Phase 2: apply connectors along each seam, between the final leaves
+        # that sit on either side of it.
+        # ------------------------------------------------------------------
+        if add_connectors and seams:
+            pieces = _apply_seam_connectors(
+                pieces,
+                seams,
+                connector_cfg,
+                engine,
+                ai_key=split_cfg.ai_key,
                 repair_mode=repair_mode,
             )
-            
-            if pos_mesh is None or neg_mesh is None:
-                continue
-            if len(pos_mesh.faces) == 0 or len(neg_mesh.faces) == 0:
-                continue
-            
-            # Check if both meshes are volumes (watertight)
-            if pos_mesh.is_volume and neg_mesh.is_volume:
-                best_pos = pos_mesh
-                best_neg = neg_mesh
-                best_decision = candidate
-                print(f"DEBUG: Found volume-safe cut at axis={candidate.axis}, pos={candidate.pos:.1f}")
-                break
-            elif best_pos is None:
-                # Keep first valid cut as fallback even if not volumes
-                best_pos = pos_mesh
-                best_neg = neg_mesh
-                best_decision = candidate
-        
-        if best_pos is None or best_neg is None:
-            pieces.append(current)
-            continue
-        
-        pos_mesh = best_pos
-        neg_mesh = best_neg
-        decision = best_decision
 
-        if add_connectors:
+        if len(pieces) == 1:
+            pieces[0] = pieces[0].copy()
+        return pieces
+    all_pieces: List[trimesh.Trimesh] = []
+    for body in bodies:
+        all_pieces.extend(_process_body(body))
+    return all_pieces
+
+
+def _apply_seam_connectors(
+    pieces: List[trimesh.Trimesh],
+    seams: List[dict],
+    connector_cfg: ConnectorConfig,
+    engine: str,
+    ai_key: Optional[str] = None,
+    repair_mode: str = "light",
+) -> List[trimesh.Trimesh]:
+    """
+    Apply connectors between the final leaves flanking each seam.
+
+    For every connector position on a seam, the leaf on the positive side
+    that contains (pos + n*eps) mates with the leaf on the negative side
+    that contains (pos - n*eps). A single hex peg + socket pair (both
+    centered on the seam plane) is booleaned into that leaf pair, so the
+    peg straddles the seam: half embedded in the pos leaf, half mating
+    with the socket cavity in the neg leaf.
+    """
+    from .connectors import _ensure_volume, connector_positions, make_hex_prism
+    from .mesh_ops import boolean_op, rotation_from_z
+    import trimesh as _tm
+
+    # Robust point-containment via manifold3d CSG: intersect a small box
+    # centred on the probe point with a SINGLE leaf manifold. Overlap ≈ box
+    # volume  =>  point is in that leaf's material; 0  =>  void / another
+    # leaf. Testing one leaf at a time avoids the coplanar-ray parity
+    # ambiguity of a global ray test. Leaf manifolds are cached by id.
+    _mf_cache = {}
+
+    def _leaf_manifold(mesh):
+        key = id(mesh)
+        m = _mf_cache.get(key)
+        if m is None:
             try:
-                # Create a unique label for this connection
-                label_str = f"P{depth}_{len(pieces)}"
-                pos_mesh, neg_mesh = apply_connectors(
-                    pos_mesh,
-                    neg_mesh,
-                    decision.plane.origin,
-                    decision.plane.normal,
-                    connector_cfg,
-                    engine,
-                    label=label_str,
-                    ai_key=split_cfg.ai_key,
-                    repair_mode=repair_mode,
-                    section_vertices=section_vertices,
-                    section_area=section_area,
-                    section_path=section_path,
+                import manifold3d as m3d
+                m = m3d.Manifold(m3d.Mesh(
+                    np.ascontiguousarray(mesh.vertices, dtype=np.float32),
+                    np.ascontiguousarray(mesh.faces, dtype=np.uint32),
+                ))
+            except Exception:
+                m = False
+            _mf_cache[key] = m
+        return m
+
+    def _point_inside(mesh, point, origin, normal, side_sign):
+        """Is `point` (ON the seam plane) inside this leaf's material on the
+        `side_sign` side of the seam?
+
+        Intersect a small box centred exactly on the point with this single
+        leaf manifold, then measure which side of the seam plane the
+        intersection material sits on. Side-fraction testing (instead of a
+        plain overlap threshold) is robust to:
+          * the box straddling the seam plane (expected: both leaves have
+            material at the same 2D point, on opposite sides);
+          * thin walls whose body surface is within a fraction of a mm of
+            the seam plane at that spot (a fixed offset + plain-overlap
+            test rejects those even though the leaf owns that material).
+        """
+        leaf_m = _leaf_manifold(mesh)
+        if not leaf_m:
+            return False
+        try:
+            import manifold3d as m3d
+            size = 0.8
+            box = m3d.Manifold.cube([size, size, size], center=True)
+            box = box.translate(np.asarray(point, dtype=np.float64))
+            inter = m3d.Manifold.batch_boolean([box, leaf_m], m3d.OpType.Intersect)
+            vol = inter.volume()
+            if vol < 0.005:  # ~0.01% of the box: effectively no material
+                return False
+            m3 = inter.to_mesh()
+            tri_verts = np.asarray(m3.tri_verts, dtype=np.uint32)
+            vert_props = np.asarray(m3.vert_properties, dtype=np.float64)
+            if len(tri_verts) == 0:
+                return False
+            centers = vert_props[tri_verts][:, :3].mean(axis=1)
+            side = np.sign((centers - np.asarray(origin, dtype=np.float64))
+                           @ np.asarray(normal, dtype=np.float64))
+            frac = float(np.mean(side == side_sign))
+            return frac > 0.35
+        except Exception:
+            return False
+
+    def resolve_leaf(pieces, origin, normal, point, side_sign, scene_min):
+        origin = np.asarray(origin, dtype=np.float64)
+        normal = np.asarray(normal, dtype=np.float64)
+        point = np.asarray(point, dtype=np.float64)
+        # prefer leaves whose centroid is on the same side of the seam
+        # plane as the side we're probing, then exact side-fraction test
+        ordered = sorted(
+            pieces,
+            key=lambda m: (
+                np.sign(float(np.dot(m.centroid - origin, normal))) != side_sign,
+                -abs(float(np.dot(m.centroid - origin, normal))),
+            ),
+        )
+        for mesh in ordered:
+            if not mesh.is_watertight:
+                continue
+            if _point_inside(mesh, point, origin, normal, side_sign):
+                return mesh
+        return None
+
+    def apply_one(pos_leaf, neg_leaf, pos, normal, r, d, tol, label, ai_key):
+        rot = rotation_from_z(normal)
+        peg = make_hex_prism(r, d)
+        peg.apply_transform(rot)
+        peg.apply_translation(pos)
+        sock = make_hex_prism(r + tol, d + tol * 2)
+        sock.apply_transform(rot)
+        sock.apply_translation(pos)
+        peg = _ensure_volume(peg, repair_mode=repair_mode)
+        sock = _ensure_volume(sock, repair_mode=repair_mode)
+        new_pos = None
+        for eng in (engine, "blender", "scad"):
+            try:
+                res = boolean_op([pos_leaf.copy(), peg], op="union", engine=eng)
+                if res is not None and len(res.faces) > 0:
+                    new_pos = res
+                    break
+            except Exception:
+                continue
+        if new_pos is None:
+            raise RuntimeError(f"peg union failed for {label}")
+        new_neg = None
+        for eng in (engine, "blender", "scad"):
+            try:
+                res = boolean_op([neg_leaf.copy(), sock], op="difference", engine=eng)
+                if res is not None and len(res.faces) > 0:
+                    new_neg = res
+                    break
+            except Exception:
+                continue
+        if new_neg is None:
+            raise RuntimeError(f"socket difference failed for {label}")
+        return new_pos, new_neg, pos_leaf, neg_leaf
+
+    EPS = 0.05  # mm inside each side from the seam plane
+
+    def _section_has_material(vertices, origin, normal, point):
+        """Is `point` on the seam's material?
+
+        The seam cross-section is a 2D region (possibly with holes, e.g. a
+        ring spinner whose cut face is an annulus). A connector position is
+        only useful if it lands on actual material, not in a hole. Test by
+        even-odd winding of the cross-section's closed loops around the
+        projected point.
+        """
+        from .mesh_ops import plane_basis
+        _, u, v = plane_basis(normal)
+        p2 = np.array([float(np.dot(point - origin, u)),
+                       float(np.dot(point - origin, v))])
+        # build closed 2D loops from the raw section vertex stream
+        loops = []
+        cur = []
+        for k in range(len(vertices)):
+            a = np.array([float(np.dot(vertices[k] - origin, u)),
+                          float(np.dot(vertices[k] - origin, v))])
+            if cur:
+                d = a - cur[-1]
+                if float(np.linalg.norm(d)) > 1e-4:
+                    cur.append(a)
+                else:
+                    if len(cur) > 2:
+                        loops.append(cur)
+                    cur = [a]
+            else:
+                cur = [a]
+        if len(cur) > 2:
+            loops.append(cur)
+        if not loops:
+            return False
+        # even-odd point-in-polygon over all loops
+        cnt = 0
+        for loop in loops:
+            n = len(loop)
+            for i in range(n):
+                x1, y1 = loop[i]
+                x2, y2 = loop[(i + 1) % n]
+                if (y1 > p2[1]) != (y2 > p2[1]):
+                    xin = x1 + (p2[1] - y1) * (x2 - x1) / (y2 - y1)
+                    if p2[0] < xin:
+                        cnt += 1
+        return (cnt % 2) == 1
+
+    # (kept for signature compatibility; the CSG box-probe doesn't need it)
+    scene_min = np.zeros(3)
+    for seam in seams:
+        origin = np.asarray(seam["origin"], dtype=np.float64)
+        normal = np.asarray(seam["normal"], dtype=np.float64)
+        vertices = seam.get("section_vertices")
+        area = seam.get("section_area")
+        label = seam.get("label", "S")
+
+        if vertices is None or len(vertices) == 0:
+            continue
+
+        margin = connector_cfg.peg_radius_mm * 2.5
+        try:
+            positions = connector_positions(vertices, origin, normal, connector_cfg.count, margin)
+        except Exception as e:
+            print(f"Warning: connector positions failed for {label}: {e}")
+            continue
+
+        if not positions:
+            continue
+
+        # Keep only positions that land on the seam's actual material. A
+        # ring/annular cut face has its bounding-box centre in a hole, so
+        # centre-line positions there would float in void and never mate.
+        good = [pos for pos in positions
+                if _section_has_material(vertices, origin, normal, pos)]
+        if not good:
+            print(f"Warning: no connector positions on material for {label}")
+            continue
+        if len(good) != len(positions):
+            print(f"DEBUG: {label}: {len(good)}/{len(positions)} positions on material")
+        positions = good
+
+        # Determine style for this seam (same heuristics as apply_connectors)
+        style = connector_cfg.style
+        if style == "auto":
+            a = area if area and area > 0 else 0.0
+            if a > 800:
+                style = "dovetail"
+            elif a < 30:
+                style = "none"
+            else:
+                style = "hex"
+
+        if style == "none":
+            continue
+
+        if style != "hex":
+            # Dovetail/lip seams: fall back to the original paired call for the
+            # two leaves closest to this seam (keeps behavior, no re-cut risk
+            # because these leaves are final).
+            print(f"DEBUG: seam {label} style={style}: using paired connector application")
+            # resolve the two leaves nearest the seam on each side
+            pos_cand = None
+            neg_cand = None
+            for mesh in pieces:
+                if not mesh.is_watertight:
+                    continue
+                s = float(np.dot(mesh.centroid - origin, normal))
+                if s > 0 and pos_cand is None:
+                    pos_cand = mesh
+                if s < 0 and neg_cand is None:
+                    neg_cand = mesh
+            if pos_cand is None or neg_cand is None:
+                continue
+            old_pos, old_neg = pos_cand, neg_cand
+            try:
+                from .connectors import apply_connectors as _ac
+                pos_cand, neg_cand = _ac(
+                    pos_cand, neg_cand, origin, normal, connector_cfg, engine,
+                    label=label, ai_key=ai_key, repair_mode=repair_mode,
+                    section_vertices=vertices, section_area=area,
+                    section_path=seam.get("section_path"),
                 )
             except Exception as e:
-                # Fallback to no connectors if boolean fails
-                print(f"Warning: Connector failed ({e}), skipping connectors for this split.")
+                print(f"Warning: paired connectors failed for {label}: {e}")
+                continue
+            _splice(pieces, old_pos, pos_cand, old_neg, neg_cand)
+            continue
 
-        queue.append((pos_mesh, depth + 1))
-        queue.append((neg_mesh, depth + 1))
+        # hex: per-position leaf resolution
+        for i, pos in enumerate(positions):
+            r = connector_cfg.peg_radius_mm
+            d = connector_cfg.peg_depth_mm
+            tol = connector_cfg.tolerance_mm
+            if i == 0 and len(positions) > 1:
+                r *= 1.2  # orientation keying, same as apply_connectors
+            pos_pt = pos + normal * EPS
+            neg_pt = pos - normal * EPS
+            pos_leaf = resolve_leaf(pieces, origin, normal, pos_pt, 1, scene_min)
+            neg_leaf = resolve_leaf(pieces, origin, normal, neg_pt, -1, scene_min)
+            if pos_leaf is None or neg_leaf is None:
+                print(f"Warning: could not resolve leaf pair for connector {label}-{i}")
+                continue
+            try:
+                new_pos, new_neg, old_pos, old_neg = apply_one(
+                    pos_leaf, neg_leaf, pos, normal, r, d, tol, f"{label}-{i}", ai_key)
+            except Exception as e:
+                print(f"Warning: connector boolean failed for {label}-{i}: {e}")
+                continue
+            _splice(pieces, old_pos, new_pos, old_neg, new_neg)
+            print(f"DEBUG: connector {label}-{i} applied ({style})")
 
     return pieces
+
+
+def _splice(pieces: List[trimesh.Trimesh], old_a: trimesh.Trimesh, new_a: trimesh.Trimesh,
+            old_b: trimesh.Trimesh, new_b: trimesh.Trimesh):
+    """Replace old leaf meshes in `pieces` with their booleaned replacements."""
+    for i, m in enumerate(pieces):
+        if m is old_a:
+            pieces[i] = new_a
+        elif m is old_b:
+            pieces[i] = new_b
+
+

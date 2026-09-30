@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
+import numpy as np
 import trimesh
 
 from .analysis import MeshStats, analyze_mesh
@@ -65,6 +66,8 @@ def run_pipeline(
 
     pieces = arrange_on_plates(pieces, config.build_volume)
 
+    _validate_pieces(pieces, config.build_volume)
+
     output_files = export_meshes(pieces, output_path, config.output.format)
 
     return PipelineResult(
@@ -73,3 +76,35 @@ def run_pipeline(
         piece_count=len(pieces),
         output_paths=output_files,
     )
+
+
+def _validate_pieces(pieces: List, build) -> None:
+    """
+    Fail loudly on pieces that are unprintable as produced, instead of
+    silently writing a 3MF the slicer will reject or that won't fit:
+    - not watertight (slicer rejects or prints garbage)
+    - footprint exceeds the build volume in the orientation layout placed
+      them (layout puts each piece flat, min corner at the origin)
+    Exits code 2 on any failure.
+    """
+    import sys
+    build_box = np.array([build.x_mm, build.y_mm, build.z_mm])
+    ok = True
+    for i, geom in enumerate(pieces):
+        if not isinstance(geom, trimesh.Trimesh) or len(geom.faces) == 0:
+            continue
+        if not geom.is_watertight:
+            print(f"❌ piece {i}: NOT watertight — will not slice reliably")
+            ok = False
+        e = geom.bounding_box.extents
+        if not np.all(e <= build_box + 1e-6):
+            print(
+                f"❌ piece {i}: {np.round(e, 1)} exceeds build volume "
+                f"{np.round(build_box, 0)}"
+            )
+            ok = False
+    if ok:
+        print(f"✅ validation passed: {len(pieces)} pieces watertight and within build volume")
+    else:
+        print("Aborting export: fix the pieces above (or change build volume / orientation) before printing.")
+        sys.exit(2)
