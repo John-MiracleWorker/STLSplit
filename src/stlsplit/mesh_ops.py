@@ -23,6 +23,26 @@ def load_mesh(path: Path) -> trimesh.Trimesh:
     return mesh
 
 
+
+def decimate_mesh(mesh: trimesh.Trimesh, max_vertices: int) -> trimesh.Trimesh:
+    """
+    Simplifies the mesh if it exceeds the max_vertices count.
+    Uses quadratic decimation.
+    """
+    if len(mesh.vertices) <= max_vertices:
+        return mesh
+
+    print(f"📉 Decimating mesh from {len(mesh.vertices)} to {max_vertices} vertices...")
+    target_faces = int(max_vertices * 2)  # Approx relationship
+    try:
+        simplified = mesh.simplify_quadric_decimation(target_faces)
+        print(f"📉 Decimated to {len(simplified.vertices)} vertices.")
+        return simplified
+    except Exception as e:
+        print(f"⚠️ Decimation failed: {e}")
+        return mesh
+
+
 def repair_mesh(mesh: trimesh.Trimesh, mode: str = "light") -> trimesh.Trimesh:
     """
     Attempts to make a mesh watertight and manifold.

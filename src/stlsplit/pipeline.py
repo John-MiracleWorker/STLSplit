@@ -9,7 +9,7 @@ import trimesh
 from .analysis import MeshStats, analyze_mesh
 from .config import AppConfig
 from .export import export_meshes
-from .mesh_ops import load_mesh, optimize_orientation, repair_mesh
+from .mesh_ops import decimate_mesh, load_mesh, optimize_orientation, repair_mesh
 from .splitter import split_to_fit
 
 
@@ -30,6 +30,10 @@ def run_pipeline(
     add_connectors: bool = True,
 ) -> PipelineResult:
     mesh = load_mesh(input_path)
+    
+    # Decimate first to save memory
+    mesh = decimate_mesh(mesh, config.split.max_vertices)
+    
     input_stats = analyze_mesh(mesh)
 
     if repair_mode != "none":

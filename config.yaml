@@ -15,8 +15,12 @@ split:
   curvature_band_mm: 6.0
   roughness_weight: 1.0
   density_weight: 1.0
+  curvature_weight: 0.6
   orient_step_deg: 90
   cut_margin_mm: 2.0
+  helmet_seam_plates: true
+  helmet_seam_width_mm: 12.0
+  helmet_seam_thickness_mm: 2.0
 output:
   format: 3mf
   engine: manifold

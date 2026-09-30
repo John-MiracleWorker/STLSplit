@@ -1,3 +1,4 @@
+import gc
 import streamlit as st
 import trimesh
 import numpy as np
@@ -17,21 +18,29 @@ from stlsplit.config import (
     SplitConfig,
 )
 from stlsplit.pipeline import run_pipeline
+from stlsplit.mesh_ops import decimate_mesh
 
 def _load_preview_mesh(infile: Path):
     try:
-        mesh = trimesh.load_mesh(infile)
+        # Load without processing to save RAM initially
+        mesh = trimesh.load_mesh(infile, process=False)
     except Exception:
         return None
 
     if isinstance(mesh, trimesh.Scene):
         if not mesh.geometry:
             return None
-        mesh = trimesh.util.concatenate(tuple(mesh.geometry.values()))
+        # This concat can be heavy, but unavoidable for Scene->Mesh
+        try:
+            mesh = trimesh.util.concatenate(tuple(mesh.geometry.values()))
+        except Exception:
+            return None
 
     if not isinstance(mesh, trimesh.Trimesh):
         return None
-
+    
+    # Decimate aggressively for preview (50k is enough for plot)
+    mesh = decimate_mesh(mesh, 50_000)
     return mesh
 
 def _render_2d_preview(mesh: trimesh.Trimesh) -> None:
@@ -84,6 +93,22 @@ bz = st.sidebar.number_input("Build Z (mm)", 100, 1000, 250, 10)
 
 st.sidebar.header("Intelligence")
 max_depth = st.sidebar.slider("Max Recursive Splits", 1, 10, 6)
+
+# Decimation controls
+res_options = {
+    "Original (High RAM)": 100_000_000,
+    "High (1M Verts)": 1_000_000,
+    "Medium (500k Verts)": 500_000,
+    "Low (100k Verts)": 100_000,
+}
+res_selection = st.sidebar.selectbox(
+    "Mesh Resolution", 
+    list(res_options.keys()), 
+    index=2, # Default to Medium to be safe
+    help="Reduces vertex count to prevent crashes on large files."
+)
+max_verts = res_options[res_selection]
+
 support_w = st.sidebar.slider("Support Weight", 0.0, 2.0, 0.8, help="Favor cuts that create flat bases")
 api_key = st.sidebar.text_input("Gemini API Key (Optional)", type="password", help="Enables Semantic Awareness")
 use_ai = bool(api_key)
@@ -97,12 +122,17 @@ if conn_style != "none":
     st.sidebar.caption("✅ Auto-Labeling Enabled")
     st.sidebar.caption("✅ Keyed Joints Enabled")
 
+
+# Define a local temp directory to avoid filling system partition
+TEMP_DIR = Path.cwd() / "tmp_workspace"
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
 # Main Interface
 uploaded_file = st.file_uploader("Upload Model (STL/3MF)", type=["stl", "obj", "3mf"])
 
 if uploaded_file:
     # Save temp
-    with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded_file.name).suffix) as tmp:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded_file.name).suffix, dir=str(TEMP_DIR)) as tmp:
         tmp.write(uploaded_file.getvalue())
         infile = Path(tmp.name)
     
@@ -136,7 +166,13 @@ if uploaded_file:
         else:
             _render_2d_preview(mesh)
 
+
     if st.button("🚀 Process Model", type="primary"):
+        # Free preview memory before heavy processing
+        if 'mesh' in locals():
+            del mesh
+        gc.collect()
+
         with st.spinner("Analyzing geometry & splitting..."):
             try:
                 cfg = AppConfig(
@@ -150,6 +186,7 @@ if uploaded_file:
                     split=SplitConfig(
                         max_depth=max_depth, 
                         support_weight=support_w,
+                        max_vertices=max_verts,
                         use_ai=use_ai,
                         ai_key=api_key
                     ),
@@ -157,7 +194,7 @@ if uploaded_file:
                     repair=RepairConfig(mode="light"),
                 )
                 
-                out_dir = Path(tempfile.mkdtemp())
+                out_dir = Path(tempfile.mkdtemp(dir=str(TEMP_DIR)))
                 outfile = out_dir / f"{infile.stem}_split.3mf"
                 
                 res = run_pipeline(

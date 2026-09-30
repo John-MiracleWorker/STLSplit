@@ -40,9 +40,14 @@ class SplitConfig:
     curvature_band_mm: float = 6.0
     roughness_weight: float = 1.0
     density_weight: float = 1.0
+    curvature_weight: float = 0.6
     orient_step_deg: int = 90
     cut_margin_mm: float = 2.0
     support_weight: float = 0.5
+    helmet_seam_plates: bool = True
+    helmet_seam_width_mm: float = 12.0
+    helmet_seam_thickness_mm: float = 2.0
+    max_vertices: int = 1_000_000
     use_ai: bool = False
     ai_key: str = ""
 
@@ -126,11 +131,27 @@ class AppConfig:
                 density_weight=float(
                     split.get("density_weight", SplitConfig.density_weight)
                 ),
+                curvature_weight=float(
+                    split.get("curvature_weight", SplitConfig.curvature_weight)
+                ),
                 orient_step_deg=int(
                     split.get("orient_step_deg", SplitConfig.orient_step_deg)
                 ),
                 cut_margin_mm=float(split.get("cut_margin_mm", SplitConfig.cut_margin_mm)),
                 support_weight=float(split.get("support_weight", SplitConfig.support_weight)),
+                helmet_seam_plates=bool(
+                    split.get("helmet_seam_plates", SplitConfig.helmet_seam_plates)
+                ),
+                helmet_seam_width_mm=float(
+                    split.get("helmet_seam_width_mm", SplitConfig.helmet_seam_width_mm)
+                ),
+                helmet_seam_thickness_mm=float(
+                    split.get(
+                        "helmet_seam_thickness_mm",
+                        SplitConfig.helmet_seam_thickness_mm,
+                    )
+                ),
+                max_vertices=int(split.get("max_vertices", SplitConfig.max_vertices)),
                 use_ai=bool(split.get("use_ai", False)),
                 ai_key=str(split.get("ai_key", "")),
             ),

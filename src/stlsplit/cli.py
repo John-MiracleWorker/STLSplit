@@ -36,6 +36,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-pieces", type=int, help="Max pieces (0 = unlimited)")
     parser.add_argument("--orient-step", type=int, help="Orientation step degrees (e.g., 90)")
     parser.add_argument(
+        "--curvature-weight",
+        type=float,
+        help="Weight for gaussian curvature when scoring cut planes",
+    )
+    parser.add_argument(
         "--repair-mode",
         choices=["none", "light", "aggressive"],
         help="Repair mode for mesh cleanup",
@@ -82,6 +87,8 @@ def apply_overrides(config: AppConfig, args: argparse.Namespace) -> AppConfig:
         split = replace(split, max_pieces=args.max_pieces)
     if args.orient_step is not None:
         split = replace(split, orient_step_deg=args.orient_step)
+    if args.curvature_weight is not None:
+        split = replace(split, curvature_weight=args.curvature_weight)
 
     output = config.output
     if args.format:

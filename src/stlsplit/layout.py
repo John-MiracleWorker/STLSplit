@@ -32,19 +32,42 @@ def orient_to_bed(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
 
         # Calculate area for each facet
         facet_areas = []
+        num_faces = len(mesh.area_faces)
         for facet_idxs in facets:
-            facet_areas.append(np.sum(mesh.area_faces[facet_idxs]))
+            # Filter out invalid indices
+            valid_idxs = facet_idxs[facet_idxs < num_faces]
+            if len(valid_idxs) > 0:
+                facet_areas.append(np.sum(mesh.area_faces[valid_idxs]))
+            else:
+                facet_areas.append(0.0)
         
+        if not facet_areas or max(facet_areas) == 0:
+            # Fallback if no valid facets
+            min_z = mesh.bounds[0][2]
+            mesh.apply_translation([0, 0, -min_z])
+            return mesh
+
         best_idx = np.argmax(facet_areas)
         
         # Get normal of the largest facet
         facet_normals = getattr(mesh, 'facets_normal', None)
         if facet_normals is None:
             # Calculate normal manually from average of face normals
-            best_normal = np.mean(mesh.face_normals[facets[best_idx]], axis=0)
+            valid_idxs = facets[best_idx]
+            valid_idxs = valid_idxs[valid_idxs < len(mesh.face_normals)]
+            if len(valid_idxs) == 0:
+                min_z = mesh.bounds[0][2]
+                mesh.apply_translation([0, 0, -min_z])
+                return mesh
+            best_normal = np.mean(mesh.face_normals[valid_idxs], axis=0)
             best_normal = best_normal / np.linalg.norm(best_normal)
         else:
-            best_normal = facet_normals[best_idx]
+            try:
+                best_normal = facet_normals[best_idx]
+            except (IndexError, KeyError):
+                min_z = mesh.bounds[0][2]
+                mesh.apply_translation([0, 0, -min_z])
+                return mesh
         
         # We want this normal to point DOWN (-Z)
         target = np.array([0.0, 0.0, -1.0])

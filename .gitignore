@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Generated output
+output/
+tmp_workspace/
+*.3mf
+*.stl
+!sample.stl
+
+# OS
+.DS_Store

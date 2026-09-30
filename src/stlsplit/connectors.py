@@ -349,6 +349,123 @@ def make_lip_groove(
         print(f"DEBUG: make_lip_groove failed: {e}")
         return None, None
 
+
+def make_seam_plate(
+    section_path: Optional[trimesh.path.Path3D],
+    section_vertices: np.ndarray,
+    plane_origin: np.ndarray,
+    plane_normal: np.ndarray,
+    plate_thickness: float,
+    plate_width: float,
+    engine: Optional[str] = None,
+) -> Optional[trimesh.Trimesh]:
+    """
+    Creates a thin internal seam plate that follows the cut profile.
+    The plate is a ring inset from the section boundary by plate_width.
+    """
+    from shapely.geometry import MultiPoint, MultiPolygon, Polygon
+    from shapely.ops import unary_union
+    from shapely import buffer
+
+    try:
+        _, u, v = plane_basis(plane_normal)
+
+        poly_2d = None
+        if section_path is not None:
+            try:
+                planar, _ = section_path.to_2D(normal=plane_normal)
+                polygons = list(getattr(planar, "polygons_full", []))
+                if polygons:
+                    poly_2d = unary_union(polygons)
+            except Exception:
+                pass
+
+        if poly_2d is None and section_vertices is not None and len(section_vertices) >= 3:
+            verts = _finite_vertices(section_vertices)
+            if len(verts) >= 3:
+                coords = np.vstack(
+                    (
+                        np.dot(verts - plane_origin, u),
+                        np.dot(verts - plane_origin, v),
+                    )
+                ).T
+                if np.isfinite(coords).all():
+                    poly_2d = MultiPoint(coords).convex_hull
+
+        if poly_2d is None or poly_2d.is_empty:
+            return None
+
+        inner = buffer(poly_2d, -plate_width)
+        if inner.is_empty:
+            inner = buffer(poly_2d, -plate_width * 0.5)
+        if inner.is_empty:
+            return None
+
+        ring = poly_2d.difference(inner)
+        if ring.is_empty or ring.area <= 0:
+            return None
+
+        def extrude_geometry(geom, height, engine):
+            meshes = []
+            if isinstance(geom, MultiPolygon):
+                for poly in geom.geoms:
+                    if not poly.is_empty and poly.area > 0:
+                        try:
+                            m = trimesh.creation.extrude_polygon(
+                                poly, height=height, engine=engine
+                            )
+                            if m is not None and len(m.vertices) > 0:
+                                meshes.append(m)
+                        except Exception:
+                            pass
+            elif isinstance(geom, Polygon):
+                if not geom.is_empty and geom.area > 0:
+                    try:
+                        m = trimesh.creation.extrude_polygon(
+                            geom, height=height, engine=engine
+                        )
+                        if m is not None and len(m.vertices) > 0:
+                            meshes.append(m)
+                    except Exception:
+                        pass
+
+            if not meshes:
+                return None
+            if len(meshes) == 1:
+                return meshes[0]
+            return trimesh.util.concatenate(meshes)
+
+        plate_mesh = extrude_geometry(ring, plate_thickness, engine)
+        if plate_mesh is None:
+            return None
+
+        if section_path is not None:
+            try:
+                _, to_3d = section_path.to_2D(normal=plane_normal)
+                plate_mesh.apply_transform(to_3d)
+            except Exception:
+                transform = np.eye(4)
+                transform[:3, 0] = u
+                transform[:3, 1] = v
+                transform[:3, 2] = plane_normal / np.linalg.norm(plane_normal)
+                transform[:3, 3] = plane_origin
+                plate_mesh.apply_transform(transform)
+        else:
+            transform = np.eye(4)
+            transform[:3, 0] = u
+            transform[:3, 1] = v
+            transform[:3, 2] = plane_normal / np.linalg.norm(plane_normal)
+            transform[:3, 3] = plane_origin
+            plate_mesh.apply_transform(transform)
+
+        plate_mesh.apply_translation(-plane_normal * (plate_thickness * 0.5))
+        plate_mesh = _clean_mesh(plate_mesh)
+        return plate_mesh
+
+    except Exception as e:
+        print(f"DEBUG: make_seam_plate failed: {e}")
+        return None
+
 def _section_bbox_area(
     section_vertices: np.ndarray,
     plane_origin: np.ndarray,
@@ -715,9 +832,67 @@ def apply_connectors(
         if not pos_success:
             print(f"DEBUG: All peg boolean engines failed: {peg_errors}")
 
-        # NO FALLBACK CONCATENATION - if boolean failed, skip connectors entirely
-        # This prevents floating connector geometry from appearing in the output
+
         if not pos_success:
+            print("Warning: Connector boolean failed. Attempting overlay fallback...")
+            
+            # --- OVERLAY FALLBACK LOGIC ---
+            # Create solid patches to hold the connectors
+            try:
+                patch_depth = config.peg_depth_mm + config.tolerance_mm * 2
+                if style == "dovetail":
+                     patch_depth = config.dovetail_width_mm # Deeper for dovetails?
+                
+                # Make patches
+                pos_patch = _cap_patch_from_section(
+                    section_path, section_vertices, plane_origin, plane_normal, 
+                    depth=patch_depth, engine=engine, direction=1.0
+                )
+                neg_patch = _cap_patch_from_section(
+                    section_path, section_vertices, plane_origin, plane_normal, 
+                    depth=patch_depth, engine=engine, direction=-1.0
+                )
+                
+                if pos_patch is None or neg_patch is None:
+                    # Fallback to box if section extraction failed
+                    print("DEBUG: Section patch failed, utilizing bounding box patch")
+                    area_ = _section_bbox_area(section_vertices, plane_origin, plane_normal)
+                    if area_ > 0:
+                        side = np.sqrt(area_) 
+                        # This bbox logic is a bit weak, but better than nothing
+                        # We really need the patch from section.
+                        pass # relying on _cap_patch_from_section to handle it or return None
+
+                if pos_patch and neg_patch:
+                    # Apply Connectors to Patches
+                    # POSITIVE: Union Pegs (or difference for magnets)
+                    if style == "magnet":
+                         res_p = boolean_op([pos_patch, peg_comb], op="difference", engine=engine, check_volume=False)
+                    else:
+                         res_p = boolean_op([pos_patch, peg_comb], op="union", engine=engine, check_volume=False)
+                    
+                    if res_p and len(res_p.faces) > 0:
+                         pos_patch = res_p
+                    
+                    # NEGATIVE: Difference Sockets
+                    if style == "magnet":
+                        res_n = boolean_op([neg_patch, sock_comb], op="difference", engine=engine, check_volume=False)
+                    else:
+                        res_n = boolean_op([neg_patch, sock_comb], op="difference", engine=engine, check_volume=False)
+
+                    if res_n and len(res_n.faces) > 0:
+                        neg_patch = res_n
+                        
+                    # Concatenate to base meshes
+                    final_pos = trimesh.util.concatenate([base_pos, pos_patch])
+                    final_neg = trimesh.util.concatenate([base_neg, neg_patch])
+                    
+                    print("DEBUG: Overlay fallback successful. Connectors applied via patches.")
+                    return final_pos, final_neg
+            
+            except Exception as e:
+                print(f"Warning: Overlay fallback failed: {e}")
+
             print("Warning: Connector boolean failed. Skipping connectors for this cut.")
             return base_pos, base_neg
 
